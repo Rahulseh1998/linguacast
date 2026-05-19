@@ -36,8 +36,15 @@ Voice quality is the tiebreaker if both engines pass the hard floors.
 
 | Engine | License | Approx. params | Quantization story | Native voice clone |
 | --- | --- | --- | --- | --- |
-| Qwen3-TTS | Apache-2.0 (per HF model card) | ~7B (full) / 4B (quantized variant) | int4 / int8 via Qwen's own quantized release | Yes — zero-shot from a 3–10s reference clip |
+| Qwen3-TTS-12Hz-1.7B-CustomVoice | Apache-2.0 (verified on HF, Jan 2026) | 1.7B | Not needed — full precision fits 8 GB | Yes — zero-shot from a short reference clip |
 | Voicebox (Meta) | **Under review** — public release license unclear; original paper says research-only | ~330M (base) / 2.5B (large) | n/a — already small enough | Yes — flow-matching, very high fidelity |
+
+**Discovery note (2026-05-19):** the bare `Qwen/Qwen3-TTS` and
+`Qwen/Qwen3-TTS-Quantized` ids do not exist on HF. The actual Qwen3
+TTS family is published as `Qwen/Qwen3-TTS-12Hz-1.7B-*`. At 1.7B params
+the full-precision model already fits the 8 GB target with room. The
+`--tts qwen3-tts-quantized` CLI knob is preserved for back-compat but
+silently aliases to the full-precision variant.
 
 **Status of the Voicebox license check (as of 2026-05-19):** the original
 2023 paper made the weights research-only. A 2024 community fork is
@@ -68,18 +75,24 @@ Results land in this doc under the "Results" section below.
 ## Decision flow
 
 ```
-[Qwen3-TTS full] — fits 8 GB?
-  ├── yes → use it
-  └── no  → [Qwen3-TTS quantized] — fits 8 GB?
-              ├── yes → use it
+[Qwen3-TTS-12Hz-1.7B-CustomVoice] — fits 8 GB?
+  ├── yes (1.7B params at fp16 ≈ 3.4 GB resident) → use it ← CURRENT
+  └── no  → [Qwen3-TTS-12Hz-1.7B-VoiceDesign] (prompt-based, not clone)?
+              ├── yes → use it (loses voice-clone "wow" but ships)
               └── no  → [Voicebox] — license cleared AND fits 8 GB?
                           ├── yes → use it
                           └── no  → ESCALATE to CTO before spending >1 day
                                     on a workaround (per kickoff comment).
-                                    Alternatives: XTTS-v2 (CPL but check),
-                                    Parler-TTS (Apache-2.0), or F5-TTS
-                                    (MIT). All week-2 territory.
+                                    Alternatives: F5-TTS (MIT, voice clone),
+                                    Parler-TTS (Apache-2.0, no clone),
+                                    XTTS-v2 (CPL — non-permissive, REJECT).
 ```
+
+**Provisional pick (pending end-to-end synthesis run):** Qwen3-TTS-12Hz-1.7B-CustomVoice.
+The license is verified Apache-2.0, params fit comfortably under the 8 GB
+ceiling without quantization, and the architecture is purpose-built for
+the zero-shot voice clone workflow we need. The synthesis-loop commit on
+[OPE-19](https://example.invalid/OPE-19) is what locks this in.
 
 ## Results
 
