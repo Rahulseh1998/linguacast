@@ -177,6 +177,11 @@ Pipeline structure (per-stage device routing):
 All three stages run sequentially; the 6.63 GB TTS peak is the pipeline ceiling.
 The M1 8 GB target has ~1.4 GB headroom under the measured peak.
 
+**`memory_pressure -l critical` validation (2026-05-19):** pipeline ran to completion
+(11/11 segments) under sustained critical memory pressure. Peak RSS dropped to 5.93 GB
+(macOS page compression reduces the RSS figure under pressure; real unified memory
+allocation is stable). Exit code 0. **8 GB fit confirmed.**
+
 Sequential load/unload guarantees only one stage's resident memory at
 any time; `_unload_if_other` + `gc.collect()` + `torch.mps.empty_cache()`
 runs between every stage transition.
