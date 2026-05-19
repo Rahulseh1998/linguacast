@@ -255,18 +255,26 @@ def _load_whisper(size: str) -> Any:
 
 # --- MT: MADLAD-400 --------------------------------------------------------
 
+def _mt_family(key: str) -> str:
+    if key.startswith("m2m100"):
+        return "m2m100"
+    if key.startswith("helsinki"):
+        return "helsinki"
+    return "madlad"
+
+
 def _load_mt(mt_key: str, device: str) -> Tuple[Any, Any, str, str]:
     """Load an MT model on `device`. Returns (model, tokenizer, device, family).
 
-    family is "m2m100" or "madlad" — the translate loop picks the right API
-    based on the family.
+    family is "m2m100" | "madlad" | "helsinki" — the translate loop picks
+    the right API based on the family.
     """
     _unload_if_other("mt")
     if _loaded_stage == "mt":
         return _loaded_handle
     key = _mt_resolve(mt_key)
     model_id = MT_MODELS[key]
-    family = "m2m100" if key.startswith("m2m100") else "madlad"
+    family = _mt_family(key)
     log(f"loading {model_id} on {device}…")
     import torch  # pyright: ignore
 
@@ -275,6 +283,7 @@ def _load_mt(mt_key: str, device: str) -> Tuple[Any, Any, str, str]:
     #  - MADLAD-3B + MPS + fp16 trips the T5 multinomial sampler (repetition
     #    loops). CPU bf16 is the documented MADLAD-on-8GB-M1 path: 3B × 2B
     #    ≈ 6 GB resident + activations, fits 8 GB. CUDA gets bf16.
+    #  - Helsinki (MarianMT) is ~300 MB; fp32 everywhere.
     if device == "cuda":
         dtype = torch.bfloat16
     elif family == "madlad" and device == "cpu":
@@ -282,7 +291,7 @@ def _load_mt(mt_key: str, device: str) -> Tuple[Any, Any, str, str]:
     elif family == "madlad":
         dtype = torch.float32   # MPS MADLAD: fp32 only
     else:
-        dtype = torch.float32   # M2M-100 fp32
+        dtype = torch.float32   # M2M-100 / Helsinki fp32
 
     # `device_map={"": device}` loads directly into the target device via
     # accelerate, avoiding the CPU↔MPS double-allocation spike that
@@ -298,6 +307,19 @@ def _load_mt(mt_key: str, device: str) -> Tuple[Any, Any, str, str]:
             )
         else:
             mdl = M2M100ForConditionalGeneration.from_pretrained(
+                model_id, dtype=dtype, low_cpu_mem_usage=True,
+            ).to(device)
+    elif family == "helsinki":
+        # MarianMT — EN→ES specialist. No language tokens; the source
+        # sentence goes in verbatim. ~300 MB weights at fp32.
+        from transformers import MarianMTModel, MarianTokenizer  # pyright: ignore
+        tok = MarianTokenizer.from_pretrained(model_id)
+        if device_map is not None:
+            mdl = MarianMTModel.from_pretrained(
+                model_id, dtype=dtype, device_map=device_map, low_cpu_mem_usage=True,
+            )
+        else:
+            mdl = MarianMTModel.from_pretrained(
                 model_id, dtype=dtype, low_cpu_mem_usage=True,
             ).to(device)
     else:
@@ -319,13 +341,15 @@ def _load_mt(mt_key: str, device: str) -> Tuple[Any, Any, str, str]:
 
 # MT model registry. M2M-100-418M (MIT) is the default for 8 GB M1 fit
 # (CTO ack 2026-05-19 comment 73a125be). MADLAD-3B stays exposed as opt-in
-# for ≥16 GB users. Family note: M2M-100 is MIT-licensed; NLLB (its sibling
-# Facebook model) is CC-BY-NC and is rejected by the license allowlist. Do
-# not confuse the two.
+# for ≥16 GB users. Helsinki/opus-mt-en-es (Apache-2.0, ~300 MB) is an
+# EN→ES specialist opt-in. Family note: M2M-100 is MIT-licensed; NLLB (its
+# sibling Facebook model) is CC-BY-NC and is rejected by the license
+# allowlist. Do not confuse the two.
 MT_MODELS = {
-    "m2m100-418m": "facebook/m2m100_418M",      # MIT, ~5 GB peak (default)
-    "madlad-3b":   "google/madlad400-3b-mt",    # Apache-2.0, ~11 GB MPS / ~6 GB CPU bf16
-    "madlad-10b":  "google/madlad400-10b-mt",   # Apache-2.0, won't fit 8 GB
+    "m2m100-418m":    "facebook/m2m100_418M",        # MIT, ~5 GB peak (default)
+    "madlad-3b":      "google/madlad400-3b-mt",      # Apache-2.0, ~11 GB MPS / ~6 GB CPU bf16
+    "madlad-10b":     "google/madlad400-10b-mt",     # Apache-2.0, won't fit 8 GB
+    "helsinki-en-es": "Helsinki-NLP/opus-mt-en-es",  # Apache-2.0, ~300 MB (EN→ES only)
 }
 
 # Legacy alias map for the `mt` payload field. Accepts the old "3b"/"10b"
@@ -335,6 +359,7 @@ MT_ALIASES = {
     "10b": "madlad-10b",
     "madlad": "madlad-3b",
     "m2m100": "m2m100-418m",
+    "helsinki": "helsinki-en-es",
 }
 
 
@@ -382,6 +407,12 @@ def _load_qwen_tts(size: str, device: str) -> Any:
     log(f"loading {model_id} on {device} (this downloads ~3.4 GB on first run)…")
     import torch  # pyright: ignore
 
+    # qwen_tts 0.1.1 prints a flash-attn banner to stdout on import, which poisons
+    # the JSON-per-line IPC protocol. Capture and redirect to stderr.
+    import io as _io
+    _stdout_capture = _io.StringIO()
+    _orig_stdout = sys.stdout
+    sys.stdout = _stdout_capture
     try:
         from qwen_tts import Qwen3TTSModel  # pyright: ignore
     except Exception as exc:
@@ -389,6 +420,11 @@ def _load_qwen_tts(size: str, device: str) -> Any:
             f"qwen-tts package is required for TTS but isn't importable: {exc}. "
             f"Install with `pip install qwen-tts`."
         ) from exc
+    finally:
+        sys.stdout = _orig_stdout
+        _banner = _stdout_capture.getvalue()
+        if _banner.strip():
+            print(f"[sidecar][qwen_tts import stdout captured] {_banner.strip()}", file=sys.stderr, flush=True)
 
     # MPS + voice_clone needs fp32 — fp16 trips the multinomial sampler at
     # decode time. CUDA prefers bf16. CPU stays fp32.
@@ -566,6 +602,26 @@ def op_translate(payload: Dict[str, Any]) -> Dict[str, Any]:
                     num_beams=4,
                 )
             translated = tok.batch_decode(generated, skip_special_tokens=True)[0].strip()
+            out_segments.append(
+                {"start": seg["start"], "end": seg["end"], "text": translated}
+            )
+    elif family == "helsinki":
+        # MarianMT is direction-baked into the checkpoint (en→es here), so
+        # there is no target-language token; we pass the source text as-is.
+        if target_lang != "es":
+            raise SidecarError(
+                f"helsinki-en-es is EN→ES only; got target_lang={target_lang!r}. "
+                "Use --mt m2m100-418m or --mt madlad-3b for other languages."
+            )
+        for seg in segments_in:
+            inputs = tok(seg["text"], return_tensors="pt").to(device_used)
+            with _torch_module().inference_mode():
+                generated = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    num_beams=4,
+                )
+            translated = tok.decode(generated[0], skip_special_tokens=True).strip()
             out_segments.append(
                 {"start": seg["start"], "end": seg["end"], "text": translated}
             )

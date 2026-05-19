@@ -163,11 +163,15 @@ impl AsrModel {
 /// `MADLAD-400-1B` variant referenced in the CTO ack fallback list does
 /// not exist as a public Apache-2.0 release (verified 2026-05-19).
 #[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
-#[clap(rename_all = "kebab-case")]
 pub enum MtModel {
+    #[clap(name = "m2m100-418m")]
     M2M100418M,
+    #[clap(name = "madlad-3b")]
     Madlad3B,
+    #[clap(name = "madlad-10b")]
     Madlad10B,
+    #[clap(name = "helsinki-en-es")]
+    HelsinkiEnEs,
 }
 
 impl MtModel {
@@ -176,6 +180,7 @@ impl MtModel {
             MtModel::M2M100418M => "m2m100-418m",
             MtModel::Madlad3B => "madlad-3b",
             MtModel::Madlad10B => "madlad-10b",
+            MtModel::HelsinkiEnEs => "helsinki-en-es",
         }
     }
 }

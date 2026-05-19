@@ -152,11 +152,9 @@ accident. M2M-100 = ship; NLLB = block.
 ≥16 GB hosts. The runtime forces it to CPU with bf16 (≈6 GB resident +
 activations), since the MPS path OOMs.
 
-**Optional upgrades the CTO authorized (half-day budget):**
-- `MADLAD-3B-CPU-bf16` end-to-end under `memory_pressure -l critical` —
-  if it actually fits and quality wins, default could swap.
-- `Helsinki-NLP/opus-mt-en-es` MarianMT — ~300 MB, EN→ES specialist.
-  Verify per-model-card license (Apache-2.0 on this one) before A/B.
+**Optional upgrades the CTO authorized (half-day budget) — results in OPE-42 section below:**
+- `MADLAD-3B-CPU-bf16`: measured 2026-05-19. Does **not** fit 8 GB M1 — see below.
+- `Helsinki-NLP/opus-mt-en-es`: Apache-2.0 confirmed, wired, A/B measured 2026-05-19 — see below.
 
 ### Stage 3: TTS — Qwen3-TTS-12Hz-1.7B-Base
 
@@ -177,7 +175,7 @@ Pipeline structure (per-stage device routing):
 |---|---|---|---|---|
 | ASR | `Systran/faster-whisper-large-v3` | CPU int8 | int8 | **3.86 GB** |
 | MT  | `facebook/m2m100_418M` (default)  | MPS fp32 | fp32 | **3.86 GB** (no delta over ASR baseline) |
-| MT  | `google/madlad400-3b-mt` (opt-in) | CPU (forced) | bf16 | ~6 GB resident (measured pending) |
+| MT  | `google/madlad400-3b-mt` (opt-in) | CPU (forced) | bf16 | **~6 GB resident** (ioreg delta 0 — CPU-only; see OPE-42 measurements) |
 | TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`   | MPS fp32 | fp32 | **6.63 GB** |
 
 All three stages run sequentially; the 6.63 GB TTS peak is the pipeline ceiling.
@@ -197,6 +195,111 @@ runs between every stage transition.
 - **TTS:** `Qwen/Qwen3-TTS-12Hz-1.7B-Base` via `qwen-tts>=0.1.1` (Apache-2.0).
 - **MT (default, 8 GB-safe):** `facebook/m2m100_418M` (MIT).
 - **MT (opt-in, ≥16 GB):** `google/madlad400-3b-mt` (Apache-2.0), CPU bf16.
+- **MT (opt-in, EN→ES specialist):** `Helsinki-NLP/opus-mt-en-es` (Apache-2.0), MPS fp32.
 - **ASR:** `Systran/faster-whisper-large-v3` (MIT), CPU int8 on macOS.
 - **Rejected:** Voicebox (no permissive release), NLLB (CC-BY-NC),
   MADLAD-1B (does not exist on a permissive license).
+
+---
+
+## OPE-42 measurements (2026-05-19)
+
+### Bug fix: qwen-tts 0.1.1 stdout pollution
+
+`qwen_tts/core/tokenizer_25hz/vq/whisper_encoder.py:35` does a bare `print()` to
+**stdout** when `flash_attn` is not installed. This wrote `\n` as the first
+character on the sidecar's stdout pipe, which the Rust orchestrator read as the
+JSON response line, got an empty string, and reported "EOF while parsing a value".
+The bug caused all three pipeline runs (MADLAD, Helsinki, M2M-100) to fail at the
+TTS stage before this fix was applied.
+
+**Fix (sidecar/main.py `_load_qwen_tts`):** capture stdout around
+`from qwen_tts import Qwen3TTSModel` and redirect the captured banner to stderr.
+The banner is benign (flash-attn performance suggestion, not an error); it now
+appears as `[sidecar][qwen_tts import stdout captured] ...` in the progress stream.
+
+### (a) MADLAD-3B CPU bf16 — measurement and verdict
+
+**Verdict: does not fit 8 GB M1. No default swap. `--mt madlad-3b` stays opt-in for ≥16 GB.**
+
+#### Measurement (ioreg + vm_stat poller, memory_pressure -l critical)
+
+| Metric | Value |
+|---|---|
+| MT wall time | **59.7s** (11 segments EN→ES, beam_size=4) |
+| ioreg "Alloc system memory" baseline (after Whisper unload) | ~3.14 GB |
+| ioreg "Alloc system memory" during MADLAD load | ~3.13–3.22 GB |
+| **ioreg delta (GPU unified memory)** | **~0 GB** — CPU-only model; no MPS allocation |
+| vm_stat pages active during MADLAD load (under pressure) | ~11.3 GB |
+| Estimated MADLAD CPU heap (vm_stat active − baseline ~5.3 GB) | **~6.0 GB** |
+| vm_stat free (under memory_pressure -l critical) | ~4.4 GB |
+
+#### Why it doesn't fit
+
+Apple Silicon unified memory means CPU heap and MPS allocations share the same
+physical pool. After MADLAD unloads, PyTorch's CPU allocator retains ~6 GB of
+heap pages (jemalloc does not call `madvise(MADV_FREE)` aggressively). When TTS
+then tries to allocate 3.4 GB on MPS, the combined live footprint is:
+
+```
+~6 GB (MADLAD CPU residue) + 3.4 GB (TTS MPS) + ~1.5 GB (Python+system) ≈ 10.9 GB
+```
+
+This exceeds the 8 GB M1 ceiling. On the 64 GB dev machine the pipeline completes
+(plenty of physical memory), but would jetsam-kill on a real 8 GB M1.
+
+Comparison to M2M-100 default: M2M-100 on MPS (~0.5 GB) releases cleanly via
+`torch.mps.empty_cache()`. TTS then sees ≈0.5 GB residue + 3.4 GB fresh = 3.9 GB
+new MPS → 6.63 GB total ioreg alloc → 1.4 GB headroom on 8 GB M1.
+
+#### CLI bug fixed (related)
+
+`--mt madlad-3b` (and all MT enum values) were not accepted by the CLI: clap's
+`rename_all = "kebab-case"` derived `madlad3-b` / `m2m100418m` instead of the
+advertised `madlad-3b` / `m2m100-418m`. The default value `"m2m100-418m"` also
+failed to parse. Fixed by adding explicit `#[clap(name = "...")]` per variant.
+
+### (b) Helsinki-NLP/opus-mt-en-es — license, wiring, A/B
+
+**License: Apache-2.0** (verified on the specific model card, not the family page).
+
+**Wired:** added to `MT_MODELS` + `MT_ALIASES` in `sidecar/main.py`, new MarianMT
+family dispatch in `_load_mt` and `op_translate`, `HelsinkiEnEs` variant added to
+`cli.rs` `MtModel` enum with `#[clap(name = "helsinki-en-es")]`.
+
+#### Memory (MarianMT on MPS)
+
+~300 MB weights, fp32 on MPS. ioreg delta during MT stage ≈ 0.3 GB. After unload,
+MPS cache clears cleanly. No impact on the 6.63 GB TTS ceiling.
+
+#### Speed
+
+| Model | MT wall time (11 segments) |
+|---|---|
+| `facebook/m2m100_418M` (default) | ~8s |
+| `Helsinki-NLP/opus-mt-en-es` | **2.1s** |
+
+Helsinki is ~4× faster on EN→ES because it is a direction-baked specialist (no
+language-token overhead, smaller decoder vocab).
+
+#### Text quality A/B (canonical 58s clip, 11 segments)
+
+Both models produce serviceable Spanish. Helsinki is generally more idiomatic;
+M2M-100 is more literal. Selected segment comparison:
+
+| Seg | EN | M2M-100 | Helsinki |
+|---|---|---|---|
+| 2 | "fades into the noise" | "conversación que **fallece**" (dies) | "conversación que **se desvanece**" (fades) ✓ |
+| 2 | "ephemeral" | "**efemérico**" (calendar event) | "**efímera**" ✓ |
+| 6 | "what we say in public" | "lo que **damos** en público" (we give) | "lo que **decimos** en público" ✓ |
+| 7 | "posts don't" | "los **posts** no" (untranslated) | "los **postes** no" (fence posts) |
+
+Both mistranslate "posts" (seg 7) — expected, as "blog post" is a domain-specific term.
+Helsinki wins on general vocabulary accuracy.
+
+#### Verdict
+
+`--mt helsinki-en-es` is a useful EN→ES specialist opt-in: ~4× faster MT, ~300 MB
+vs ~5 GB model, Apache-2.0. **Default stays M2M-100** (multilingual; Helsinki is
+EN→ES only, errors on "posts"). Users can opt in with `--mt helsinki-en-es` for
+faster pipeline on EN→ES content.

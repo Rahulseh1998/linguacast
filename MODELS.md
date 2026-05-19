@@ -32,6 +32,7 @@ introduce nested tables. Add rows in alphabetical order by `Model`.
 | ASR | Whisper large-v3 (CTranslate2) | Systran/faster-whisper-large-v3 | MIT | https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE |
 | ASR | Whisper large-v3 (original) | openai/whisper-large-v3 | MIT | https://github.com/openai/whisper/blob/main/LICENSE |
 | ASR | Whisper medium (CTranslate2 fallback) | Systran/faster-whisper-medium | MIT | https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE |
+| MT | Helsinki-NLP opus-mt-en-es (opt-in, EN→ES only) | Helsinki-NLP/opus-mt-en-es | Apache-2.0 | https://huggingface.co/Helsinki-NLP/opus-mt-en-es |
 | MT | M2M-100 418M (default) | facebook/m2m100_418M | MIT | https://huggingface.co/facebook/m2m100_418M/blob/main/README.md |
 | MT | MADLAD-400 3B-MT (opt-in, ≥16 GB) | google/madlad400-3b-mt | Apache-2.0 | https://huggingface.co/google/madlad400-3b-mt/blob/main/LICENSE |
 | TTS | Qwen3-TTS 12Hz 0.6B Base | Qwen/Qwen3-TTS-12Hz-0.6B-Base | Apache-2.0 | https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/blob/main/LICENSE |
