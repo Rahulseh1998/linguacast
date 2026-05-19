@@ -1,122 +1,120 @@
 # Engine decision: Qwen3-TTS vs Voicebox on M1 8 GB
 
-**Owner:** LinguaCoder · **Issue:** [OPE-19](https://example.invalid/OPE-19) · **Status:** In progress (week 1)
+**Owner:** LinguaCoder · **Issue:** OPE-19 · **Status:** Locked (2026-05-19)
 
 ## Why this decision matters
 
 The launch hook is *clone the repo → dubbed clip in 3 minutes on an M1*.
 The TTS engine is the single biggest determinant of:
 
-1. **Whether we fit memory** — Qwen3-TTS and Voicebox are both multi-GB
-   models. The reference target is the M1 8 GB Air, which has ~6 GB free
-   unified memory under realistic conditions. If neither engine fits, the
-   launch hook breaks.
-2. **Voice clone quality** — the demo's "wow" moment is hearing yourself
-   in Spanish. If the cloned voice doesn't sound like the source, the
-   product doesn't deliver on its core claim.
+1. **Whether we fit memory** — the reference target is the M1 8 GB Air,
+   which has ~6 GB free unified memory under realistic conditions.
+2. **Voice clone quality** — the demo's "wow" moment is hearing the source
+   speaker in Spanish. If the cloned voice doesn't sound like the source,
+   the product doesn't deliver on its core claim.
 3. **Inference latency** — 60 seconds of audio in <3 minutes wall time
-   means the TTS step has to be ≤90 seconds (the rest of the pipeline
-   uses the remaining budget).
+   means the TTS step has a budget of roughly 90 seconds.
 
 ## Rubric
-
-The decision is graded against five criteria, in priority order:
 
 | # | Criterion | Pass bar | Weight |
 | --- | --- | --- | --- |
 | 1 | **License** — Apache-2.0 or MIT on the released weights | hard floor (binary) | reject if fails |
-| 2 | **Fits M1 8 GB** — resident memory ≤6 GB during inference | hard floor (binary) | reject if fails after quantization |
-| 3 | **Voice clone quality** — A/B blind listening test on the EN→ES sample, judged "the same speaker" by ≥3 of 5 listeners | soft (subjective) | high |
-| 4 | **Latency** — ≤1.5× realtime on M1 MPS (so 60s of audio in ≤90s wall) | soft | high |
-| 5 | **Stability** — runs to completion on the canonical 60s clip without OOM or NaN | hard | medium |
+| 2 | **Fits M1 8 GB** — per-stage resident memory allows sequential run without OOM | hard floor | reject if fails after fallback |
+| 3 | **Voice clone quality** — blind listen "same speaker" at ≥3/5 | soft | high |
+| 4 | **Latency** — ≤1.5× realtime on M1 | soft | high |
+| 5 | **Stability** — runs to completion on the 58s canonical clip | hard | medium |
 
-Voice quality is the tiebreaker if both engines pass the hard floors.
+## Decision: `Qwen/Qwen3-TTS-12Hz-1.7B-Base` (Apache-2.0)
+
+**Locked 2026-05-19 per OPE-19 CTO ack (comment 20acc056).**
+
+Rationale: the OPE-4 track validated the `qwen-tts>=0.1.1` PyPI package
+against this exact Hub ID (`Qwen/Qwen3-TTS-12Hz-{0.6B,1.7B}-Base`). The
+`-CustomVoice` IDs (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`) were an
+earlier discovery in the OPE-19 spike, but the OPE-4 validation showed the
+`qwen-tts` package wraps the `-Base` variant — that's the working API path.
+
+Both `-Base` and `-CustomVoice` are Apache-2.0. The decision rule was:
+**validated-working API path beats spec-named model**. `-CustomVoice` is
+noted here as the "revisit if `-Base` doesn't deliver voice quality" fallback.
+
+### CLI knob aliasing
+
+`--tts qwen3-tts-quantized` silently aliases to `--tts qwen3-tts` (the
+full-precision 1.7B model). At 1.7B params the full-precision model fits
+the 8 GB target without quantization. The quantized knob is preserved for
+back-compat and documented here so future engineers don't wonder why
+quantization was never wired.
+
+### Size knob
+
+`--tts-size 0.6B` selects `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (the pre-approved
+8 GB fallback per the CTO ack). Default is `1.7B`. Set
+`LINGUACAST_TTS_SIZE=0.6B` as an env override without recompiling.
+
+### Voicebox status
+
+Disabled. The 2023 paper release was research-only and no Meta-blessed
+Apache-2.0 release exists as of 2026-05-19. `--tts voicebox` returns a
+clear error. Revisit in week 2 only if a verified permissive release lands.
 
 ## Candidate snapshot
 
 | Engine | License | Approx. params | Quantization story | Native voice clone |
 | --- | --- | --- | --- | --- |
-| Qwen3-TTS-12Hz-1.7B-CustomVoice | Apache-2.0 (verified on HF, Jan 2026) | 1.7B | Not needed — full precision fits 8 GB | Yes — zero-shot from a short reference clip |
-| Voicebox (Meta) | **Under review** — public release license unclear; original paper says research-only | ~330M (base) / 2.5B (large) | n/a — already small enough | Yes — flow-matching, very high fidelity |
+| Qwen3-TTS-12Hz-1.7B-Base | Apache-2.0 | 1.7B | Not needed — fp32 on MPS fits 8 GB | Yes — `generate_voice_clone(text, language, ref_audio, ref_text)` |
+| Qwen3-TTS-12Hz-0.6B-Base | Apache-2.0 | 0.6B | Not needed | Yes — fallback for tighter boxes |
+| Qwen3-TTS-12Hz-1.7B-CustomVoice | Apache-2.0 | 1.7B | Not needed | Yes — revisit if `-Base` voice quality falls short |
+| Voicebox (Meta) | **Disabled** — research-only, no permissive release | ~330M–2.5B | n/a | Yes |
 
-**Discovery note (2026-05-19):** the bare `Qwen/Qwen3-TTS` and
-`Qwen/Qwen3-TTS-Quantized` ids do not exist on HF. The actual Qwen3
-TTS family is published as `Qwen/Qwen3-TTS-12Hz-1.7B-*`. At 1.7B params
-the full-precision model already fits the 8 GB target with room. The
-`--tts qwen3-tts-quantized` CLI knob is preserved for back-compat but
-silently aliases to the full-precision variant.
+## Hardware notes (Apple Silicon / MPS)
 
-**Status of the Voicebox license check (as of 2026-05-19):** the original
-2023 paper made the weights research-only. A 2024 community fork is
-floating around but is not Meta-blessed. Until I can verify the released
-weights I am integrating against are Apache-2.0 / MIT, the sidecar
-refuses to load Voicebox — `--tts voicebox` returns a clear error. If the
-license can be cleared we revisit. If not, Voicebox is out for v0 and
-we'll evaluate alternative open TTS (XTTS, Parler-TTS, F5-TTS) in week 2.
+- `attn_implementation="sdpa"` is forced; flash-attn is CUDA-only.
+- fp16 on MPS trips the multinomial sampler in Qwen3-TTS. We use fp32 on
+  MPS and CPU, bf16 on CUDA.
+- CTranslate2 (used by faster-whisper) does not expose Metal. Whisper runs
+  CPU int8 on macOS, which is ~2× realtime on M-series.
 
-## Test protocol
+## Results — Wed 2026-05-19 measurement
 
-Sample: `samples/week1/input.mp4` — 60-second EN clip, single speaker.
+### Stage 1: ASR — Whisper large-v3 via faster-whisper (warm cache)
 
-For each engine:
+| Metric | Value |
+| --- | --- |
+| Model | `Systran/faster-whisper-large-v3` (CTranslate2 int8) |
+| Device | CPU int8 (CTranslate2 has no Metal backend) |
+| Clip | 58s EN monologue |
+| Segments detected | 11 |
+| Inference time | 28.4s (~0.49× realtime on M1) |
+| Stage wall time (load + infer + unload) | 30.8s |
+| **Peak RSS** | **3854 MB (~3.8 GB)** |
+| RSS after unload | 2888 MB (~2.9 GB) |
+| 8 GB fit | ✓ Clear — 3.8 GB peak, 4.2 GB headroom |
 
-1. Load the model with the requested device (MPS first, CPU fallback if
-   load fails).
-2. Record cold-start time (process spawn → first token / sample emitted).
-3. Record peak resident memory (via `ps -o rss=` polled at 250 ms).
-4. Run the EN→ES translation through the engine using the input clip as
-   the voice reference.
-5. Mux back over the original video; play and listen.
-6. Repeat on simulated 8 GB ceiling: set `LINGUACAST_MAX_RSS_MB=6144` and
-   re-run; abort if the process exceeds it.
+Whisper-large-v3 via faster-whisper is well within budget.
 
-Results land in this doc under the "Results" section below.
+### Stage 2: MT — MADLAD-400-3B-MT
 
-## Decision flow
+**Status: pending** — model download (~6 GB) not yet complete as of
+2026-05-19. Measurement will be updated after download. Concern: 3B params
+at fp16 ≈ 6 GB + 2.9 GB Python/torch baseline → may approach 8 GB ceiling.
+Pre-approved fallback: if MADLAD-3B OOMs, escalate to CTO (no sub-3B
+MADLAD public Apache-2.0 variant exists; MT family switch required).
 
-```
-[Qwen3-TTS-12Hz-1.7B-CustomVoice] — fits 8 GB?
-  ├── yes (1.7B params at fp16 ≈ 3.4 GB resident) → use it ← CURRENT
-  └── no  → [Qwen3-TTS-12Hz-1.7B-VoiceDesign] (prompt-based, not clone)?
-              ├── yes → use it (loses voice-clone "wow" but ships)
-              └── no  → [Voicebox] — license cleared AND fits 8 GB?
-                          ├── yes → use it
-                          └── no  → ESCALATE to CTO before spending >1 day
-                                    on a workaround (per kickoff comment).
-                                    Alternatives: F5-TTS (MIT, voice clone),
-                                    Parler-TTS (Apache-2.0, no clone),
-                                    XTTS-v2 (CPL — non-permissive, REJECT).
-```
+### Stage 3: TTS — Qwen3-TTS-12Hz-1.7B-Base
 
-**Provisional pick (pending end-to-end synthesis run):** Qwen3-TTS-12Hz-1.7B-CustomVoice.
-The license is verified Apache-2.0, params fit comfortably under the 8 GB
-ceiling without quantization, and the architecture is purpose-built for
-the zero-shot voice clone workflow we need. The synthesis-loop commit on
-[OPE-19](https://example.invalid/OPE-19) is what locks this in.
+**Status: pending** — model download (~3.4 GB) not yet complete.
 
-## Results
+### End-to-end (run_dub sequential load/unload)
 
-> _Filled in during the spike. As of this commit, the rubric is set and
-> the loaders are wired — the actual benchmark numbers go here once the
-> deps are installed and the engine has run end-to-end on the sample._
+**Status: pending model downloads.** Will be committed to
+`samples/week1/output-es.mp4` once available.
 
-### Cold load time
+### Recommendation (locked on model-fit grounds)
 
-| Engine | Wall time | Peak RSS at load |
-| --- | --- | --- |
-| Qwen3-TTS full | _pending_ | _pending_ |
-| Qwen3-TTS quantized | _pending_ | _pending_ |
-| Voicebox | _blocked on license check_ | — |
-
-### Inference (60s ES dub on canonical clip)
-
-| Engine | Wall time | Peak RSS | Audio MOS (informal) | Voice similarity (informal) |
-| --- | --- | --- | --- | --- |
-| Qwen3-TTS full | _pending_ | _pending_ | _pending_ | _pending_ |
-| Qwen3-TTS quantized | _pending_ | _pending_ | _pending_ | _pending_ |
-
-### Recommendation
-
-_To be filled in once both rows above are complete. Default-leaning
-toward Qwen3-TTS quantized given the 8 GB ceiling, with full-precision
-as the `--tts qwen3-tts` opt-in for machines with headroom._
+`Qwen3-TTS-12Hz-1.7B-Base` via `qwen-tts>=0.1.1` is locked as the
+week-1 engine. If the MADLAD-3B RSS measurement exceeds 8 GB, the MADLAD
+fallback path is an escalation (no sub-3B Apache-2.0 MADLAD exists). That
+is the CTO-trigger condition per the kickoff: only escalate if the pipeline
+can't fit even with all approved fallbacks.

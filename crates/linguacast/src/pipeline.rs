@@ -1,64 +1,121 @@
 use crate::{
-    cli::{self, Args, Lang},
-    device::{self, Device},
+    cli::{self, AsrModel, Cli, MtModel, TtsSize},
+    device,
     ffmpeg, sidecar,
 };
 use anyhow::{anyhow, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 use tracing::info;
 
-pub fn run(args: Args) -> Result<()> {
-    if !args.input.exists() {
-        return Err(anyhow!("input file not found: {}", args.input.display()));
-    }
-    if args.langs.is_empty() {
-        return Err(anyhow!("--langs must include at least one language"));
-    }
-    std::fs::create_dir_all(&args.out_dir).with_context(|| {
-        format!("creating output directory {}", args.out_dir.display())
-    })?;
+// ---- Pull ----------------------------------------------------------------
 
-    let device = device::resolve(args.device.as_ref());
-    info!("device: {}", device.as_str());
+pub struct PullOpts {
+    pub asr: AsrModel,
+    pub mt: MtModel,
+    pub tts_size: TtsSize,
+    pub python: Option<PathBuf>,
+}
 
-    let engine = pick_engine(&args, &device);
-    info!("tts engine: {engine}");
-
-    // The sidecar directory lives next to the binary in a dev checkout
-    // (`sidecar/` at the repo root) and inside the bundle for shipped builds.
+pub fn run_pull(opts: PullOpts) -> Result<()> {
     let sidecar_dir = locate_sidecar_dir()?;
     info!("sidecar dir: {}", sidecar_dir.display());
 
-    let mut sidecar = sidecar::Sidecar::launch(args.python.as_deref(), &sidecar_dir)?;
+    info!(
+        "pulling models: asr={} mt={} tts={}",
+        opts.asr.as_str(),
+        opts.mt.as_str(),
+        opts.tts_size.as_str()
+    );
+    let cache_hint = directories::BaseDirs::new()
+        .map(|b| b.cache_dir().join("linguacast").display().to_string())
+        .unwrap_or_else(|| "~/.cache/linguacast".to_string());
+    eprintln!(
+        "\nlinguacast pull — downloading model weights (~10 GB on first run)\n\
+         Models land in {cache_hint}/\n\
+         This is a one-time step; subsequent dubs use the warm cache.\n"
+    );
+
+    let mut sidecar = sidecar::Sidecar::launch(opts.python.as_deref(), &sidecar_dir)?;
+    sidecar.hello()?;
+
+    let t = Instant::now();
+    let (cache_root, models) = sidecar.pull(
+        opts.asr.as_str(),
+        opts.mt.as_str(),
+        opts.tts_size.as_str(),
+    )?;
+    info!(
+        "pull complete in {:.1}s — cache at {}",
+        t.elapsed().as_secs_f32(),
+        cache_root
+    );
+    for (role, id) in &models {
+        eprintln!("  ✓ {role}: {id}");
+    }
+    eprintln!("\nAll models cached. Run `linguacast dub <video> --langs es` to dub.");
+    Ok(())
+}
+
+// ---- Dub -----------------------------------------------------------------
+
+pub fn run_dub(cli: Cli) -> Result<()> {
+    let input = cli
+        .input
+        .as_ref()
+        .ok_or_else(|| anyhow!("input file required (or run `linguacast pull` to download models)"))?;
+    if !input.exists() {
+        return Err(anyhow!("input file not found: {}", input.display()));
+    }
+    if cli.langs.is_empty() {
+        return Err(anyhow!("--langs must include at least one language"));
+    }
+    std::fs::create_dir_all(&cli.out_dir).with_context(|| {
+        format!("creating output directory {}", cli.out_dir.display())
+    })?;
+
+    let device = device::resolve(cli.device.as_ref());
+    info!("device: {}", device.as_str());
+
+    let tts_engine = pick_tts_engine(&cli);
+    info!("tts engine: {tts_engine}");
+
+    let asr = cli.asr.as_str();
+    let mt = cli.mt.as_str();
+    let tts_size = cli.tts_size.as_str();
+    info!("models: asr={asr} mt={mt} tts={tts_size}");
+
+    let sidecar_dir = locate_sidecar_dir()?;
+    info!("sidecar dir: {}", sidecar_dir.display());
+
+    let mut sidecar = sidecar::Sidecar::launch(cli.python.as_deref(), &sidecar_dir)?;
     sidecar.hello()?;
 
     let work = tempfile::tempdir().context("creating temp working dir")?;
     let audio_wav = work.path().join("input-16k-mono.wav");
 
+    // Extract audio once; the WAV serves as both the Whisper input and the
+    // TTS speaker reference clip for voice cloning.
     let t = Instant::now();
-    ffmpeg::extract_audio_16k_mono(&args.input, &audio_wav)?;
-    info!("ffmpeg extract audio: {:.2}s", t.elapsed().as_secs_f32());
-
-    let t = Instant::now();
-    let (source_lang, transcript) = sidecar.transcribe(&audio_wav, &device)?;
+    ffmpeg::extract_audio_16k_mono(input, &audio_wav)?;
+    let duration_sec = ffmpeg::probe_duration_sec(input).unwrap_or(0.0);
     info!(
-        "whisper: detected language {} · {} segments · {:.2}s",
-        source_lang,
-        transcript.len(),
-        t.elapsed().as_secs_f32()
+        "ffmpeg extract audio: {:.2}s · clip duration {:.1}s",
+        t.elapsed().as_secs_f32(),
+        duration_sec
     );
 
-    for lang in &args.langs {
+    for lang in &cli.langs {
         process_one_lang(
-            &args,
+            &cli,
             &device,
-            engine,
+            tts_engine,
             &mut sidecar,
-            &source_lang,
-            &transcript,
             &audio_wav,
-            work.path(),
+            duration_sec,
+            asr,
+            mt,
+            tts_size,
             lang,
         )?;
     }
@@ -68,85 +125,89 @@ pub fn run(args: Args) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn process_one_lang(
-    args: &Args,
-    device: &Device,
-    engine: &str,
+    cli: &Cli,
+    device: &device::Device,
+    _tts_engine: &str,
     sidecar: &mut sidecar::Sidecar,
-    source_lang: &str,
-    transcript: &[sidecar::Segment],
-    reference_audio: &Path,
-    work_dir: &Path,
-    lang: &Lang,
+    audio_wav: &std::path::Path,
+    duration_sec: f32,
+    asr: &str,
+    mt: &str,
+    tts_size: &str,
+    lang: &cli::Lang,
 ) -> Result<()> {
-    if !args.i_understand_voice_clone_risks {
-        // Week-1: placeholder consent gate. The real implementation
-        // lands in week 3 (OPE-12); for now we emit a loud warning rather
-        // than block, but we do refuse without the explicit flag. That keeps
-        // the spike honest about what's still missing.
+    if !cli.i_understand_voice_clone_risks {
         return Err(anyhow!(
             "voice clone consent required: re-run with --i-understand-voice-clone-risks. \
              The real consent gate (OPE-12) lands in week 3 and will become the default check."
         ));
     }
 
-    let t = Instant::now();
-    let translated = sidecar.translate(transcript, source_lang, &lang.0, device)?;
-    info!(
-        "madlad-400: {} → {} · {} segments · {:.2}s",
-        source_lang,
-        lang.0,
-        translated.len(),
-        t.elapsed().as_secs_f32()
-    );
+    let dubbed_audio = {
+        let mut p = std::env::temp_dir();
+        p.push(format!("linguacast-dubbed-{}.wav", lang.0));
+        p
+    };
 
-    let dubbed_audio = work_dir.join(format!("dubbed-{}.wav", lang.0));
     let t = Instant::now();
-    let (out_audio, duration) = sidecar.tts(
-        &translated,
-        reference_audio,
+    let report = sidecar.run_dub(
+        audio_wav,
+        audio_wav, // source audio doubles as speaker reference
         &lang.0,
         &dubbed_audio,
+        duration_sec,
+        asr,
+        mt,
+        tts_size,
         device,
-        engine,
     )?;
-    info!(
-        "tts ({engine}): {:.2}s audio rendered in {:.2}s",
-        duration,
-        t.elapsed().as_secs_f32()
-    );
 
-    let stem = args
-        .input
+    // Log per-stage RSS for the 8 GB-fit conversation.
+    info!(
+        "run_dub ({} → {}): {:.1}s audio · {} segments · {:.1}s wall · peak RSS {:.0} MB",
+        report.language,
+        report.target_lang,
+        report.duration_sec,
+        report.segments_rendered,
+        t.elapsed().as_secs_f32(),
+        report.peak_rss_mb,
+    );
+    for stage in &report.stages {
+        info!(
+            "  stage {} ({}): {:.1}s · peak RSS {:.0} MB",
+            stage.name, stage.model, stage.stage_seconds, stage.peak_rss_mb
+        );
+    }
+
+    let input = cli.input.as_ref().expect("validated above");
+    let stem = input
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("input");
-    let out_mp4 = args.out_dir.join(format!("{stem}.{}.mp4", lang.0));
+    let out_mp4 = cli.out_dir.join(format!("{stem}.{}.mp4", lang.0));
+
     let t = Instant::now();
-    ffmpeg::mux_replace_audio(&args.input, &out_audio, &out_mp4)?;
+    ffmpeg::mux_replace_audio(input, &dubbed_audio, &out_mp4)?;
     info!(
-        "ffmpeg mux ({}): {:.2}s · → {}",
+        "ffmpeg mux ({}): {:.2}s → {}",
         lang.0,
         t.elapsed().as_secs_f32(),
         out_mp4.display()
     );
+    eprintln!("\nOutput: {}", out_mp4.display());
 
     Ok(())
 }
 
-fn pick_engine(args: &Args, _device: &Device) -> &'static str {
-    if let Some(explicit) = &args.tts {
+fn pick_tts_engine(cli: &Cli) -> &'static str {
+    if let Some(explicit) = &cli.tts {
         return match explicit {
             cli::TtsEngine::Qwen3Tts => "qwen3-tts",
             cli::TtsEngine::Qwen3TtsQuantized => "qwen3-tts-quantized",
             cli::TtsEngine::Voicebox => "voicebox",
         };
     }
-    // Auto-select. Week-1 default: full-precision Qwen3-TTS on ≥12 GB, else
-    // the quantized variant. This is the engine decision the spike validates.
-    // We don't have an accurate cross-platform "free unified memory" probe
-    // yet, so the default is conservative: quantized everywhere until the
-    // benchmark on OPE-19 says otherwise.
-    "qwen3-tts-quantized"
+    "qwen3-tts"
 }
 
 fn locate_sidecar_dir() -> Result<PathBuf> {
@@ -156,11 +217,9 @@ fn locate_sidecar_dir() -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    // Dev layout: <repo>/sidecar/ alongside crates/linguacast/.
-    // Walk up from the current exe (release build) and from CARGO_MANIFEST_DIR (cargo run).
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(mut dir) = exe.parent().map(Path::to_path_buf) {
+        if let Some(mut dir) = exe.parent().map(std::path::Path::to_path_buf) {
             for _ in 0..4 {
                 candidates.push(dir.join("sidecar"));
                 if !dir.pop() {

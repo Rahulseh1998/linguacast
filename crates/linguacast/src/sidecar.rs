@@ -1,6 +1,7 @@
 use crate::device::Device;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -8,7 +9,7 @@ use tracing::{debug, warn};
 
 /// One JSON request per line on stdin, one JSON response per line on stdout.
 /// Stderr is forwarded to the user's terminal — model download progress and
-/// load times go there.
+/// per-stage load times go there.
 pub struct Sidecar {
     child: Child,
     stdin: ChildStdin,
@@ -19,14 +20,21 @@ pub struct Sidecar {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request<'a> {
     Hello,
+    Pull {
+        asr: &'a str,
+        mt: &'a str,
+        tts_size: &'a str,
+    },
     Transcribe {
         audio_path: &'a Path,
         device: &'a str,
+        asr: &'a str,
     },
     Translate {
         segments: &'a [Segment],
         source_lang: &'a str,
         target_lang: &'a str,
+        mt: &'a str,
         device: &'a str,
     },
     Tts {
@@ -34,8 +42,24 @@ pub enum Request<'a> {
         reference_audio_path: &'a Path,
         target_lang: &'a str,
         out_audio_path: &'a Path,
+        target_duration_sec: f32,
+        ref_text: &'a str,
+        tts_size: &'a str,
         device: &'a str,
         engine: &'a str,
+    },
+    /// End-to-end dub: transcribe → translate → tts in one IPC call with
+    /// sequential load/unload between each stage.
+    RunDub {
+        audio_path: &'a Path,
+        reference_audio_path: &'a Path,
+        target_lang: &'a str,
+        out_audio_path: &'a Path,
+        target_duration_sec: f32,
+        asr: &'a str,
+        mt: &'a str,
+        tts_size: &'a str,
+        device: &'a str,
     },
 }
 
@@ -47,6 +71,14 @@ pub struct Segment {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct StageReport {
+    pub name: String,
+    pub model: String,
+    pub stage_seconds: f64,
+    pub peak_rss_mb: f64,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
     Hello {
@@ -54,20 +86,40 @@ pub enum Response {
         torch_device: String,
         torch_version: String,
     },
+    Pull {
+        cache_root: String,
+        models: BTreeMap<String, String>,
+    },
     Transcribe {
         language: String,
         segments: Vec<Segment>,
+        #[serde(default)]
+        peak_rss_mb: f64,
     },
     Translate {
         segments: Vec<Segment>,
+        #[serde(default)]
+        peak_rss_mb: f64,
     },
     Tts {
         out_audio_path: PathBuf,
         duration_sec: f32,
+        #[serde(default)]
+        peak_rss_mb: f64,
+    },
+    RunDub {
+        out_audio_path: PathBuf,
+        duration_sec: f32,
+        language: String,
+        target_lang: String,
+        segments: usize,
+        segments_rendered: usize,
+        stages: Vec<StageReport>,
+        peak_rss_mb: f64,
     },
     Error {
         message: String,
-        #[allow(dead_code)] // surfaced by sidecar; not yet acted on
+        #[allow(dead_code)]
         recoverable: bool,
     },
 }
@@ -160,66 +212,86 @@ impl Sidecar {
         }
     }
 
-    pub fn transcribe(&mut self, audio: &Path, device: &Device) -> Result<(String, Vec<Segment>)> {
-        match self.send(&Request::Transcribe {
-            audio_path: audio,
-            device: device.as_str(),
+    pub fn pull(
+        &mut self,
+        asr: &str,
+        mt: &str,
+        tts_size: &str,
+    ) -> Result<(String, BTreeMap<String, String>)> {
+        match self.send(&Request::Pull {
+            asr,
+            mt,
+            tts_size,
         })? {
-            Response::Transcribe { language, segments } => Ok((language, segments)),
-            Response::Error { message, .. } => Err(anyhow!("transcribe failed: {message}")),
-            other => Err(anyhow!("unexpected transcribe response: {:?}", other)),
+            Response::Pull { cache_root, models } => Ok((cache_root, models)),
+            Response::Error { message, .. } => Err(anyhow!("pull failed: {message}")),
+            other => Err(anyhow!("unexpected pull response: {:?}", other)),
         }
     }
 
-    pub fn translate(
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_dub(
         &mut self,
-        segments: &[Segment],
-        source_lang: &str,
+        audio_path: &Path,
+        reference_audio_path: &Path,
         target_lang: &str,
+        out_audio_path: &Path,
+        target_duration_sec: f32,
+        asr: &str,
+        mt: &str,
+        tts_size: &str,
         device: &Device,
-    ) -> Result<Vec<Segment>> {
-        match self.send(&Request::Translate {
-            segments,
-            source_lang,
+    ) -> Result<RunDubReport> {
+        match self.send(&Request::RunDub {
+            audio_path,
+            reference_audio_path,
             target_lang,
+            out_audio_path,
+            target_duration_sec,
+            asr,
+            mt,
+            tts_size,
             device: device.as_str(),
         })? {
-            Response::Translate { segments } => Ok(segments),
-            Response::Error { message, .. } => Err(anyhow!("translate failed: {message}")),
-            other => Err(anyhow!("unexpected translate response: {:?}", other)),
-        }
-    }
-
-    pub fn tts(
-        &mut self,
-        segments: &[Segment],
-        reference_audio: &Path,
-        target_lang: &str,
-        out_audio: &Path,
-        device: &Device,
-        engine: &str,
-    ) -> Result<(PathBuf, f32)> {
-        match self.send(&Request::Tts {
-            segments,
-            reference_audio_path: reference_audio,
-            target_lang,
-            out_audio_path: out_audio,
-            device: device.as_str(),
-            engine,
-        })? {
-            Response::Tts {
+            Response::RunDub {
                 out_audio_path,
                 duration_sec,
-            } => Ok((out_audio_path, duration_sec)),
-            Response::Error { message, .. } => Err(anyhow!("tts failed: {message}")),
-            other => Err(anyhow!("unexpected tts response: {:?}", other)),
+                language,
+                target_lang,
+                segments,
+                segments_rendered,
+                stages,
+                peak_rss_mb,
+            } => Ok(RunDubReport {
+                out_audio_path,
+                duration_sec,
+                language,
+                target_lang,
+                segments,
+                segments_rendered,
+                stages,
+                peak_rss_mb,
+            }),
+            Response::Error { message, .. } => Err(anyhow!("run_dub failed: {message}")),
+            other => Err(anyhow!("unexpected run_dub response: {:?}", other)),
         }
     }
 }
 
+#[derive(Debug)]
+pub struct RunDubReport {
+    pub out_audio_path: PathBuf,
+    pub duration_sec: f32,
+    pub language: String,
+    pub target_lang: String,
+    pub segments: usize,
+    pub segments_rendered: usize,
+    pub stages: Vec<StageReport>,
+    pub peak_rss_mb: f64,
+}
+
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        // Best-effort: try graceful close, then SIGKILL.
         if let Err(e) = self.child.kill() {
             warn!("sidecar kill failed: {e}");
         }
@@ -238,8 +310,6 @@ fn resolve_python(python_override: Option<&Path>, script_dir: &Path) -> Result<P
     if venv.exists() {
         return Ok(venv);
     }
-    // Fall back to python3 from PATH. The sidecar will tell us if torch/etc.
-    // aren't importable, with a helpful message.
     which::which("python3").map_err(|_| {
         anyhow!(
             "no Python interpreter found. Pass --python <path> or set LINGUACAST_PYTHON. \

@@ -17,6 +17,19 @@ fn main() -> Result<()> {
         .compact()
         .init();
 
-    let args = cli::Args::parse();
-    pipeline::run(args)
+    let cli = cli::Cli::parse();
+    match cli.command.clone() {
+        Some(cli::Command::Pull {
+            asr,
+            mt,
+            tts_size,
+            python,
+        }) => pipeline::run_pull(pipeline::PullOpts {
+            asr,
+            mt,
+            tts_size,
+            python,
+        }),
+        None => pipeline::run_dub(cli),
+    }
 }

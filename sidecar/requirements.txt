@@ -1,43 +1,57 @@
 # Sidecar dependencies for linguacast.
 #
-# Every entry below is verified Apache-2.0 / MIT / BSD-3-Clause (the standard
-# permissive trio). NLLB and any CC-BY-NC / GPL packages are explicitly out.
-# See ../LICENSES.md for the audit trail.
+# Every entry below is verified Apache-2.0 / MIT / BSD-3-Clause / ISC (the
+# standard permissive set). NLLB and any CC-BY-NC / GPL packages are
+# explicitly out. See ../LICENSES.md for the audit trail and ../MODELS.md
+# for the model-weights audit (machine-parsed by
+# scripts/check_model_licenses.py).
 
 # --- Torch stack -----------------------------------------------------------
-# torch 2.5+ ships MPS (Apple Silicon) and CUDA wheels. We do not pin a
+# torch 2.9+ ships MPS (Apple Silicon) and CUDA wheels. We do not pin a
 # CUDA variant here — pip will pick the right wheel for the platform.
 torch>=2.9,<2.13           # BSD-3-Clause
 torchaudio>=2.9,<2.13      # BSD-2-Clause
 
-# --- Transformers + ASR/MT --------------------------------------------------
-transformers>=4.46,<5.0    # Apache-2.0  — MADLAD, Qwen3-TTS loaders (5.x has a Whisper-decode regression; revisit when it stabilizes)
+# --- Transformers + MT loader ----------------------------------------------
+transformers>=4.46,<5.0    # Apache-2.0  — MADLAD-400, Qwen3-TTS loaders
+                            #   (5.x has a Whisper-decode regression; revisit when it stabilises)
 accelerate>=1.0,<2.0       # Apache-2.0
 sentencepiece>=0.2.0       # Apache-2.0  — required by MADLAD/T5 tokenizer
-protobuf>=4,<8             # BSD-3-Clause — required by SentencePiece tokenizer decode
+protobuf>=4,<8             # BSD-3-Clause — required by SentencePiece decode
 
-# Whisper-large-v3 via the original openai-whisper package. MIT.
-# We chose openai-whisper over the HF transformers pipeline because the
-# pipeline's experimental seq2seq chunking returns empty segments on MPS
-# in current transformers releases, and the single-pass alternative
-# silently truncates anything over 30s. openai-whisper's long-form path
-# is the well-tested one.
-openai-whisper==20250625   # MIT
-tiktoken>=0.7              # MIT  (pulled by openai-whisper)
+# --- ASR: faster-whisper --------------------------------------------------
+# We use faster-whisper (CTranslate2-backed Whisper) instead of
+# openai-whisper. Rationale:
+#   - CPU int8 footprint on macOS is ~2.5 GB resident vs ~10 GB for
+#     openai-whisper on MPS — directly serves the OPE-19 sequential-load
+#     architecture.
+#   - On CUDA, fp16 with CTranslate2 is faster and lighter than the
+#     vanilla openai-whisper path.
+#   - License: faster-whisper is MIT, CTranslate2 is BSD-3-Clause.
+faster-whisper>=1.0.3      # MIT  — Whisper-large-v3 wrapper
+ctranslate2>=4.4           # BSD-3-Clause — pulled by faster-whisper; pinned for clarity
 
-# Audio resampling. Pulled by openai-whisper; pinned explicitly for clarity.
-librosa>=0.10,<0.12        # ISC
+# --- TTS: Qwen3-TTS via the qwen-tts PyPI package -------------------------
+# The qwen-tts package wraps Qwen/Qwen3-TTS-12Hz-{0.6B,1.7B}-Base and
+# exposes the `generate_voice_clone(text, language, ref_audio, ref_text)`
+# API we depend on. Validated by the OPE-4 track on M-series.
+qwen-tts>=0.1.1            # Apache-2.0
 
 # --- I/O + numerics --------------------------------------------------------
 numpy>=1.26,<3.0           # BSD-3-Clause
 soundfile>=0.12            # BSD-3-Clause  — WAV read/write
-huggingface-hub>=0.26,<2.0 # Apache-2.0  — model downloads
+huggingface-hub>=0.26,<2.0 # Apache-2.0    — model downloads
+
+# --- Memory instrumentation ------------------------------------------------
+# Per-stage peak RSS reporting for the 8 GB-fit launch-hook conversation.
+psutil>=5.9                # BSD-3-Clause
 
 # --- Safety + UX -----------------------------------------------------------
 # tqdm gives the user a download progress bar on first run.
 tqdm>=4.66                 # MIT + MPL-2.0 (dual)
 
 # NOTE: we deliberately do NOT depend on:
+#   - openai-whisper          (MIT — dropped in favour of faster-whisper, see above)
 #   - sentencepiece-research  (research-only)
 #   - fairseq                 (MIT but pulls NLLB models by default → license footgun)
 #   - bitsandbytes            (MIT but ships GPU-only code; pinned per-platform if needed)

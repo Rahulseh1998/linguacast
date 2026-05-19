@@ -11,6 +11,45 @@ pub fn locate() -> Result<PathBuf> {
         .map_err(|e| anyhow!("ffmpeg not found on PATH (and LINGUACAST_FFMPEG not set): {e}"))
 }
 
+/// Locate ffprobe (ships with ffmpeg). Same precedence as locate().
+pub fn locate_ffprobe() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("LINGUACAST_FFPROBE") {
+        return Ok(PathBuf::from(p));
+    }
+    which::which("ffprobe")
+        .map_err(|e| anyhow!("ffprobe not found on PATH (and LINGUACAST_FFPROBE not set): {e}"))
+}
+
+/// Probe duration in seconds via ffprobe. The TTS stage needs this to size
+/// the output track; we ask ffprobe rather than re-decoding because it's
+/// cheap and avoids spinning up another ffmpeg pass.
+pub fn probe_duration_sec(input: &Path) -> Result<f32> {
+    let ffprobe = locate_ffprobe()?;
+    let output = Command::new(&ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(input)
+        .output()
+        .with_context(|| format!("spawning ffprobe ({})", ffprobe.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "ffprobe duration probe failed ({status}): {stderr}",
+            status = output.status,
+            stderr = String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    s.parse::<f32>().map_err(|e| {
+        anyhow!("could not parse ffprobe duration {s:?}: {e}")
+    })
+}
+
 /// Extract a mono 16 kHz WAV — Whisper's preferred input format.
 pub fn extract_audio_16k_mono(input: &Path, out_wav: &Path) -> Result<()> {
     let ffmpeg = locate()?;
