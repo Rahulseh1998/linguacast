@@ -60,6 +60,16 @@ pub enum Request<'a> {
         mt: &'a str,
         tts_size: &'a str,
         device: &'a str,
+        /// OPE-13 watermark id (32-bit, hex-encoded). When set, the
+        /// sidecar embeds the perceptual watermark before writing the
+        /// synthesized track to disk.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        watermark_id: Option<&'a str>,
+    },
+    /// OPE-13 verifier: detect the perceptual watermark in a candidate
+    /// audio file (no model load required, pure numpy+scipy).
+    Verify {
+        audio_path: &'a Path,
     },
 }
 
@@ -116,12 +126,56 @@ pub enum Response {
         segments_rendered: usize,
         stages: Vec<StageReport>,
         peak_rss_mb: f64,
+        #[serde(default)]
+        watermark: serde_json::Value,
+    },
+    Verify {
+        detected: bool,
+        confidence: f64,
+        #[serde(default)]
+        watermark_id: Option<String>,
+        #[serde(default)]
+        version: Option<u64>,
+        #[serde(default)]
+        crc_ok: Option<bool>,
+        #[serde(default)]
+        repeats_voted: u64,
+        #[serde(default)]
+        bit_offset_frames: i64,
+        sample_rate: u32,
+        duration_sec: f64,
+        elapsed_sec: f64,
+        algorithm: String,
+    },
+    Progress {
+        stage: String,
+        phase: String,
+        #[serde(default)]
+        current: Option<u64>,
+        #[serde(default)]
+        total: Option<u64>,
+        #[serde(default)]
+        label: Option<String>,
     },
     Error {
         message: String,
         #[allow(dead_code)]
         recoverable: bool,
     },
+}
+
+/// Callback used by the orchestrator to surface in-flight progress.
+/// Returning `()` keeps the API trivial; if we ever need cancellation we can
+/// thread an `AtomicBool` through here instead.
+pub type ProgressFn<'a> = &'a mut dyn FnMut(ProgressEvent);
+
+#[derive(Debug, Clone)]
+pub struct ProgressEvent {
+    pub stage: String,
+    pub phase: String,
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+    pub label: Option<String>,
 }
 
 impl Sidecar {
@@ -171,6 +225,16 @@ impl Sidecar {
     }
 
     pub fn send(&mut self, req: &Request) -> Result<Response> {
+        self.send_with_progress(req, &mut |_| {})
+    }
+
+    /// Send a request and drain `kind=progress` events to `on_progress` until
+    /// a non-progress response is received.
+    pub fn send_with_progress(
+        &mut self,
+        req: &Request,
+        on_progress: ProgressFn<'_>,
+    ) -> Result<Response> {
         let line = serde_json::to_string(req).context("encoding sidecar request")?;
         debug!("→ sidecar: {}", line);
         self.stdin
@@ -179,20 +243,39 @@ impl Sidecar {
             .and_then(|_| self.stdin.flush())
             .context("writing to sidecar stdin")?;
 
-        let mut resp_line = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut resp_line)
-            .context("reading sidecar stdout")?;
-        if n == 0 {
-            return Err(anyhow!(
-                "sidecar closed stdout before responding (it may have crashed — check stderr above)"
-            ));
+        loop {
+            let mut resp_line = String::new();
+            let n = self
+                .stdout
+                .read_line(&mut resp_line)
+                .context("reading sidecar stdout")?;
+            if n == 0 {
+                return Err(anyhow!(
+                    "sidecar closed stdout before responding (it may have crashed — check stderr above)"
+                ));
+            }
+            debug!("← sidecar: {}", resp_line.trim_end());
+            let resp: Response = serde_json::from_str(resp_line.trim_end())
+                .with_context(|| format!("decoding sidecar response: {resp_line}"))?;
+            if let Response::Progress {
+                stage,
+                phase,
+                current,
+                total,
+                label,
+            } = resp
+            {
+                on_progress(ProgressEvent {
+                    stage,
+                    phase,
+                    current,
+                    total,
+                    label,
+                });
+                continue;
+            }
+            return Ok(resp);
         }
-        debug!("← sidecar: {}", resp_line.trim_end());
-        let resp: Response = serde_json::from_str(resp_line.trim_end())
-            .with_context(|| format!("decoding sidecar response: {resp_line}"))?;
-        Ok(resp)
     }
 
     pub fn hello(&mut self) -> Result<()> {
@@ -241,18 +324,24 @@ impl Sidecar {
         mt: &str,
         tts_size: &str,
         device: &Device,
+        watermark_id: Option<&str>,
+        on_progress: ProgressFn<'_>,
     ) -> Result<RunDubReport> {
-        match self.send(&Request::RunDub {
-            audio_path,
-            reference_audio_path,
-            target_lang,
-            out_audio_path,
-            target_duration_sec,
-            asr,
-            mt,
-            tts_size,
-            device: device.as_str(),
-        })? {
+        match self.send_with_progress(
+            &Request::RunDub {
+                audio_path,
+                reference_audio_path,
+                target_lang,
+                out_audio_path,
+                target_duration_sec,
+                asr,
+                mt,
+                tts_size,
+                device: device.as_str(),
+                watermark_id,
+            },
+            on_progress,
+        )? {
             Response::RunDub {
                 out_audio_path,
                 duration_sec,
@@ -260,6 +349,7 @@ impl Sidecar {
                 target_lang,
                 segments,
                 segments_rendered,
+                watermark,
                 stages,
                 peak_rss_mb,
             } => Ok(RunDubReport {
@@ -271,9 +361,43 @@ impl Sidecar {
                 segments_rendered,
                 stages,
                 peak_rss_mb,
+                watermark,
             }),
             Response::Error { message, .. } => Err(anyhow!("run_dub failed: {message}")),
             other => Err(anyhow!("unexpected run_dub response: {:?}", other)),
+        }
+    }
+
+    /// OPE-13: detect the perceptual watermark in a candidate audio file.
+    pub fn verify(&mut self, audio_path: &Path) -> Result<VerifyReport> {
+        match self.send(&Request::Verify { audio_path })? {
+            Response::Verify {
+                detected,
+                confidence,
+                watermark_id,
+                version,
+                crc_ok,
+                repeats_voted,
+                bit_offset_frames,
+                sample_rate,
+                duration_sec,
+                elapsed_sec,
+                algorithm,
+            } => Ok(VerifyReport {
+                detected,
+                confidence,
+                watermark_id,
+                version,
+                crc_ok,
+                repeats_voted,
+                bit_offset_frames,
+                sample_rate,
+                duration_sec,
+                elapsed_sec,
+                algorithm,
+            }),
+            Response::Error { message, .. } => Err(anyhow!("verify failed: {message}")),
+            other => Err(anyhow!("unexpected verify response: {:?}", other)),
         }
     }
 }
@@ -288,6 +412,22 @@ pub struct RunDubReport {
     pub segments_rendered: usize,
     pub stages: Vec<StageReport>,
     pub peak_rss_mb: f64,
+    pub watermark: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    pub detected: bool,
+    pub confidence: f64,
+    pub watermark_id: Option<String>,
+    pub version: Option<u64>,
+    pub crc_ok: Option<bool>,
+    pub repeats_voted: u64,
+    pub bit_offset_frames: i64,
+    pub sample_rate: u32,
+    pub duration_sec: f64,
+    pub elapsed_sec: f64,
+    pub algorithm: String,
 }
 
 impl Drop for Sidecar {

@@ -23,6 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 which = "8"
 tempfile = "3"
 directories = "6"
+sha2 = "0.10"
+indicatif = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = "thin"

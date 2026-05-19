@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-19",
+  "model_card_url": "https://github.com/openpipe-ai/linguacast/blob/main/docs/consent-gate.md#refusal-list",
+  "policy": "These entries name public figures whose voices have been most frequently abused in published deepfake reports. LinguaCast refuses to voice-clone for these references regardless of consent attestation; the user must take their audio elsewhere. Update path: PR to crates/linguacast/data/refusal-list.json with a press-confirmed source for the addition.",
+  "entries": [
+    {
+      "name": "Joe Biden",
+      "aliases": ["joe biden", "joseph biden", "joseph r biden", "president biden"],
+      "audio_sha256": [],
+      "reason": "Repeated robocall / political deepfake incidents (NH primary 2024)."
+    },
+    {
+      "name": "Donald Trump",
+      "aliases": ["donald trump", "donald j trump", "president trump"],
+      "audio_sha256": [],
+      "reason": "Repeated political voice-clone abuse in 2024 election cycle."
+    },
+    {
+      "name": "Kamala Harris",
+      "aliases": ["kamala harris", "vice president harris"],
+      "audio_sha256": [],
+      "reason": "Documented political voice-clone abuse in 2024 election cycle."
+    },
+    {
+      "name": "Barack Obama",
+      "aliases": ["barack obama", "president obama"],
+      "audio_sha256": [],
+      "reason": "Long-running deepfake test target; multiple academic + press demos."
+    },
+    {
+      "name": "Volodymyr Zelenskyy",
+      "aliases": ["volodymyr zelenskyy", "volodymyr zelensky", "president zelenskyy"],
+      "audio_sha256": [],
+      "reason": "Wartime disinformation deepfakes (2022)."
+    },
+    {
+      "name": "Taylor Swift",
+      "aliases": ["taylor swift"],
+      "audio_sha256": [],
+      "reason": "Repeated non-consensual deepfake incidents (2024)."
+    },
+    {
+      "name": "Elon Musk",
+      "aliases": ["elon musk"],
+      "audio_sha256": [],
+      "reason": "Frequent crypto-scam voice-clone abuse (2023-2024)."
+    },
+    {
+      "name": "Scarlett Johansson",
+      "aliases": ["scarlett johansson"],
+      "audio_sha256": [],
+      "reason": "OpenAI voice incident (2024); long-running voice-likeness disputes."
+    },
+    {
+      "name": "Morgan Freeman",
+      "aliases": ["morgan freeman"],
+      "audio_sha256": [],
+      "reason": "Long-running voice-clone abuse; viral 2021 deepfake."
+    },
+    {
+      "name": "David Attenborough",
+      "aliases": ["david attenborough", "sir david attenborough"],
+      "audio_sha256": [],
+      "reason": "Voice frequently abused in narrative-style deepfakes; subject of his own published complaints."
+    }
+  ]
+}

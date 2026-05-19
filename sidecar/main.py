@@ -45,7 +45,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-SIDECAR_VERSION = "0.2.0-dev"
+SIDECAR_VERSION = "0.3.0-dev"
 
 CACHE_ROOT = Path(
     os.environ.get("LINGUACAST_CACHE_DIR")
@@ -64,6 +64,25 @@ def log(msg: str) -> None:
 def emit(obj: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+def emit_progress(stage: str, phase: str, *, current: Optional[int] = None,
+                  total: Optional[int] = None, label: Optional[str] = None) -> None:
+    """Stream a non-terminal progress event to the orchestrator.
+
+    The Rust side drains `kind=progress` lines until it sees a non-progress
+    response (`kind=transcribe|translate|tts|run_dub|error|pull|hello`).
+    Used for per-segment TTS rendering progress where each segment can take
+    several seconds and the user otherwise sees nothing happen.
+    """
+    msg: Dict[str, Any] = {"kind": "progress", "stage": stage, "phase": phase}
+    if current is not None:
+        msg["current"] = current
+    if total is not None:
+        msg["total"] = total
+    if label is not None:
+        msg["label"] = label
+    emit(msg)
 
 
 def emit_error(message: str, *, recoverable: bool = False) -> None:
@@ -376,6 +395,10 @@ def _mt_resolve(mt_size: str) -> str:
 # --- TTS: qwen-tts wrapping Qwen3-TTS-12Hz-1.7B-Base ----------------------
 
 # ISO 639-1 → English names that Qwen3-TTS's voice-clone path expects.
+# Qwen3-TTS-12Hz-1.7B-Base natively trains on these 10 languages; for the
+# remaining launch set (hi, ar, tr) we fall to "Auto", which routes through
+# the package's language-agnostic voice-clone path. Translation accuracy is
+# unaffected — that's M2M-100's job upstream.
 QWEN_LANG_NAMES = {
     "zh": "Chinese",
     "en": "English",
@@ -387,6 +410,13 @@ QWEN_LANG_NAMES = {
     "pt": "Portuguese",
     "es": "Spanish",
     "it": "Italian",
+}
+
+# Launch-12 languages. Any code not in QWEN_LANG_NAMES (today: hi, ar, tr)
+# uses the TTS "Auto" path — the model still clones the speaker, prosody is
+# best-effort, and the launch reel A/B should flag any per-language issues.
+LAUNCH_LANGS = {
+    "es", "zh", "hi", "fr", "de", "ja", "pt", "ar", "ko", "ru", "it", "tr",
 }
 
 
@@ -525,8 +555,10 @@ def op_transcribe(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise SidecarError(f"audio file not found: {audio_path}")
 
     stage_t0 = time.time()
+    emit_progress("asr", "load", label=f"whisper-{asr_size}")
     model = _load_whisper(asr_size)
     log(f"transcribing {audio_path.name}…")
+    emit_progress("asr", "infer", label=audio_path.name)
     t0 = time.time()
     segments_iter, info = model.transcribe(
         str(audio_path),
@@ -583,9 +615,11 @@ def op_translate(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     stage_t0 = time.time()
+    emit_progress("mt", "load", label=mt_key)
     model, tok, device_used, family = _load_mt(mt_key, device)
 
     log(f"translating {len(segments_in)} segments {source_lang} → {target_lang} via {family}…")
+    emit_progress("mt", "infer", current=0, total=len(segments_in), label=target_lang)
     out_segments: List[Dict[str, Any]] = []
     t0 = time.time()
 
@@ -676,6 +710,8 @@ def op_tts(payload: Dict[str, Any]) -> Dict[str, Any]:
     ref_text: str = (payload.get("ref_text") or "").strip()
     tts_size: str = payload.get("tts_size", os.environ.get("LINGUACAST_TTS_SIZE", "1.7B"))
     device = _resolve_torch_device(payload.get("device", "auto"))
+    # OPE-13 launch-blocker: perceptual watermark id, 32-bit hex.
+    watermark_id_hex: Optional[str] = payload.get("watermark_id")
 
     if not reference.exists():
         raise SidecarError(f"reference audio not found: {reference}")
@@ -683,6 +719,7 @@ def op_tts(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise SidecarError("nothing to synthesize — translation returned 0 segments")
 
     stage_t0 = time.time()
+    emit_progress("tts", "load", label=f"qwen3-tts-{tts_size}")
     model, size_loaded = _load_qwen_tts(tts_size, device)
 
     import numpy as np  # pyright: ignore
@@ -699,9 +736,12 @@ def op_tts(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     t0 = time.time()
     rendered = 0
-    for seg in segments:
+    total_segments = len(segments)
+    emit_progress("tts", "infer", current=0, total=total_segments, label=target_lang)
+    for idx, seg in enumerate(segments, start=1):
         text = (seg.get("text") or "").strip()
         if not text:
+            emit_progress("tts", "infer", current=idx, total=total_segments, label=target_lang)
             continue
         wavs, sr = model.generate_voice_clone(
             text=text,
@@ -709,6 +749,7 @@ def op_tts(payload: Dict[str, Any]) -> Dict[str, Any]:
             ref_audio=ref_audio,
             ref_text=ref_text,
         )
+        emit_progress("tts", "infer", current=idx, total=total_segments, label=target_lang)
         audio = _to_mono_float32(wavs[0])
         if sr != out_sr:
             audio = _linear_resample(audio, sr, out_sr)
@@ -720,6 +761,34 @@ def op_tts(payload: Dict[str, Any]) -> Dict[str, Any]:
         rendered += 1
     synth_secs = time.time() - t0
     log(f"  qwen3-tts rendered {rendered}/{len(segments)} segments in {synth_secs:.2f}s")
+
+    # OPE-13 launch-blocker: embed the perceptual watermark in the
+    # synthesized track *before* writing to disk so it survives ffmpeg
+    # muxing and downstream re-encoding. The id is sent down by the
+    # orchestrator (derived deterministically from the consent_hash) so
+    # the metadata flag and the recovered watermark payload cross-check.
+    watermark_meta: Dict[str, Any] = {"embedded": False}
+    if watermark_id_hex:
+        try:
+            import watermark as wm  # local module, sidecar/watermark.py
+
+            wid = int(watermark_id_hex, 16) & 0xFFFFFFFF
+            track = wm.embed(track, sr=out_sr, watermark_id=wid)
+            watermark_meta = {
+                "embedded": True,
+                "watermark_id": f"{wid:08x}",
+                "algorithm": "patchwork-spread-spectrum-v1",
+                "alpha": wm.DEFAULT_ALPHA,
+                "bit_frames": wm.DEFAULT_BIT_FRAMES,
+            }
+            log(
+                f"  watermark embedded id={wid:08x} alpha={wm.DEFAULT_ALPHA} "
+                f"bit_frames={wm.DEFAULT_BIT_FRAMES}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Watermarking is a launch-blocker — surface failure loudly,
+            # don't silently ship un-watermarked audio.
+            raise SidecarError(f"watermark embed failed: {exc}") from exc
 
     out_audio.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(out_audio), track, out_sr, subtype="PCM_16")
@@ -739,6 +808,7 @@ def op_tts(payload: Dict[str, Any]) -> Dict[str, Any]:
         "peak_rss_mb": peak_mb,
         "current_rss_mb": rss_mb,
         "model": f"Qwen/Qwen3-TTS-12Hz-{size_loaded}-Base",
+        "watermark": watermark_meta,
     }
 
 
@@ -758,6 +828,7 @@ def op_run_dub(payload: Dict[str, Any]) -> Dict[str, Any]:
     mt_key = _mt_resolve(payload.get("mt", "m2m100-418m"))
     tts_size = payload.get("tts_size", os.environ.get("LINGUACAST_TTS_SIZE", "1.7B"))
     device = _resolve_torch_device(payload.get("device", "auto"))
+    watermark_id_hex = payload.get("watermark_id")
 
     stages: List[Dict[str, Any]] = []
 
@@ -823,6 +894,7 @@ def op_run_dub(payload: Dict[str, Any]) -> Dict[str, Any]:
             "ref_text": ref_text,
             "tts_size": tts_size,
             "device": device,
+            "watermark_id": watermark_id_hex,
         }
     )
     stages.append(
@@ -847,7 +919,47 @@ def op_run_dub(payload: Dict[str, Any]) -> Dict[str, Any]:
         "segments_rendered": tts_resp["segments_rendered"],
         "stages": stages,
         "peak_rss_mb": max(s["peak_rss_mb"] for s in stages),
+        "watermark": tts_resp.get("watermark", {"embedded": False}),
     }
+
+
+def op_verify(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify the LinguaCast watermark on an audio file.
+
+    The audio is read as mono float32, downmixed if needed. The
+    watermark detector is blind (no original required); it returns
+    detected/confidence/watermark_id/crc_ok. This op is intentionally
+    light — no model loads, just numpy + scipy — so `linguacast verify`
+    is sub-second on a typical clip.
+    """
+    audio_path = Path(payload["audio_path"])
+    if not audio_path.exists():
+        raise SidecarError(f"audio not found: {audio_path}")
+
+    import soundfile as sf  # pyright: ignore
+    import watermark as wm  # local module
+
+    audio, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1).astype("float32", copy=False)
+    duration = float(len(audio) / sr) if sr > 0 else 0.0
+
+    t0 = time.time()
+    det = wm.detect(audio, sr=sr)
+    elapsed = time.time() - t0
+
+    out: Dict[str, Any] = det.to_dict()
+    out.update(
+        {
+            "kind": "verify",
+            "audio_path": str(audio_path),
+            "sample_rate": int(sr),
+            "duration_sec": duration,
+            "elapsed_sec": elapsed,
+            "algorithm": "patchwork-spread-spectrum-v1",
+        }
+    )
+    return out
 
 
 def _to_mono_float32(x):
@@ -880,6 +992,7 @@ OPS = {
     "translate": op_translate,
     "tts": op_tts,
     "run_dub": op_run_dub,
+    "verify": op_verify,
 }
 
 

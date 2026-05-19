@@ -7,8 +7,8 @@ use std::str::FromStr;
     name = "linguacast",
     version,
     about = "Dub a video into other languages in the speaker's own voice.",
-    long_about = "linguacast input.mp4 --langs es,zh,hi,fr,de,ja,pt,ar — local-first by default.\n\
-                  Run `linguacast pull` first to pre-download model weights (~10 GB)."
+    long_about = "linguacast input.mp4 --langs es,zh,hi,fr,de,ja,pt,ar,ko,ru,it,tr — local-first by default.\n\
+                  Model weights auto-download on first run; run `linguacast pull` to pre-fetch."
 )]
 pub struct Cli {
     /// Subcommand. If omitted, the binary defaults to dub mode and the
@@ -20,15 +20,22 @@ pub struct Cli {
     /// (dub) mode; ignored when a subcommand is given.
     pub input: Option<PathBuf>,
 
-    /// Comma-separated list of target language codes (BCP-47 / ISO 639-1).
-    /// Week-1 spike supports `es` only; other codes are wired in but will
-    /// error this week.
+    /// Comma-separated list of target language codes (ISO 639-1). Launch set:
+    /// es, zh, hi, fr, de, ja, pt, ar, ko, ru, it, tr. M2M-100 accepts the
+    /// full ISO 639-1 set — codes outside the launch list will still
+    /// translate but TTS prosody for them is best-effort (Qwen3-TTS Auto path).
     #[arg(long, value_delimiter = ',', default_value = "es")]
     pub langs: Vec<Lang>,
 
     /// Output directory. Defaults to `./linguacast-out/`.
     #[arg(long, default_value = "linguacast-out")]
     pub out_dir: PathBuf,
+
+    /// After all languages render, package the outputs into
+    /// `<out_dir>/<stem>.pack.zip` (one MP4 + thumbnail per language plus
+    /// a contact-sheet GIF cycling the outputs). Shareable as a single file.
+    #[arg(long)]
+    pub pack: bool,
 
     /// Force a compute device. Default: auto-detect (mps → cuda → cpu).
     #[arg(long)]
@@ -63,8 +70,32 @@ pub struct Cli {
     #[arg(long, default_value = "1.7B")]
     pub tts_size: TtsSize,
 
-    /// Skip the consent-gate prompt. Placeholder for v0; the real gate
-    /// lands in week 3 (OPE-12) and refuses voice-clone output without it.
+    /// Path to a signed consent file (required for non-TTY runs). The file
+    /// must contain the verbatim attestation line; see `docs/consent-gate.md`.
+    /// In interactive mode the gate prompts; this flag overrides the prompt
+    /// for CI / batch pipelines.
+    #[arg(long, value_name = "PATH")]
+    pub i_have_speaker_consent: Option<PathBuf>,
+
+    /// Optional self-declared speaker name. Used for the refusal-list check
+    /// and recorded in the consent ledger. Metadata only — it does not
+    /// influence voice-clone fidelity.
+    #[arg(long, value_name = "NAME")]
+    pub speaker_name: Option<String>,
+
+    /// Override the refusal list (JSON, same schema as the embedded one in
+    /// `data/refusal-list.json`). For tests and for ops who want a stricter
+    /// list than the upstream default.
+    #[arg(long, value_name = "PATH")]
+    pub refusal_list: Option<PathBuf>,
+
+    /// Override the consent-record store directory. Default is
+    /// `$LINGUACAST_HOME/consents/` or `~/.linguacast/consents/`.
+    #[arg(long, value_name = "PATH")]
+    pub consent_store_dir: Option<PathBuf>,
+
+    /// Deprecated week-1 flag. The consent gate (OPE-12) is the real check
+    /// now. Kept hidden so old scripts still parse without effect.
     #[arg(long, hide = true)]
     pub i_understand_voice_clone_risks: bool,
 
@@ -94,6 +125,25 @@ pub enum Command {
         /// Path to the Python sidecar interpreter (see top-level `--python`).
         #[arg(long)]
         python: Option<PathBuf>,
+    },
+    /// Inspect a (possibly third-party-edited) MP4/M4A and report:
+    ///   • whether the LinguaCast perceptual watermark is detected,
+    ///   • the watermark id recovered from the audio bits,
+    ///   • the consent-hash / version / signer pulled from container metadata.
+    /// Per OPE-13, the watermark is the load-bearing claim — metadata can be
+    /// stripped by `ffmpeg -map_metadata -1` but the watermark survives a
+    /// 1080p H.264 + AAC re-encode at ≥80% on the survival corpus.
+    Verify {
+        /// Path to the file to inspect (MP4, M4A, WAV — anything ffmpeg can read).
+        input: PathBuf,
+
+        /// Path to the Python sidecar interpreter (see top-level `--python`).
+        #[arg(long)]
+        python: Option<PathBuf>,
+
+        /// Emit a machine-readable JSON report instead of the human one.
+        #[arg(long)]
+        json: bool,
     },
 }
 

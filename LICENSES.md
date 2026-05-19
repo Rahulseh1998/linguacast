@@ -51,6 +51,9 @@ Audited via `cargo metadata` against the workspace's direct deps. Run
 | which | 8.x | MIT | locate ffmpeg / python on PATH |
 | tempfile | 3.x | MIT OR Apache-2.0 | scratch dirs for pipeline |
 | directories | 6.x | MIT OR Apache-2.0 | platform-aware cache paths |
+| sha2 | 0.10.x | MIT OR Apache-2.0 | SHA-256 of reference audio + consent file (OPE-12 consent gate) |
+| indicatif | 0.17.x | MIT | per-language progress bars (OPE-44 UX) |
+| zip | 2.x | MIT | `--pack` zip writer (no default features; deflate only) |
 
 All of the above are MIT or MIT/Apache dual-licensed. Transitive deps are
 audited as part of the cargo-deny step (TODO: wire `deny.toml` into CI in

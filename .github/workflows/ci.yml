@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build · ${{ matrix.target.name }}
+    runs-on: ${{ matrix.target.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { name: macos-arm64, os: macos-14,     triple: aarch64-apple-darwin }
+          - { name: macos-x64,   os: macos-13,     triple: x86_64-apple-darwin }
+          - { name: linux-x64,   os: ubuntu-22.04, triple: x86_64-unknown-linux-gnu }
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: short
+      # Mock-sidecar smoke runs without real model downloads.
+      LINGUACAST_SIDECAR_DIR: ${{ github.workspace }}/sidecar-mock
+      LINGUACAST_CACHE_DIR: ${{ runner.temp }}/linguacast-cache
+      LINGUACAST_HOME: ${{ runner.temp }}/linguacast-home
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.target.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.target.name }}-
+
+      - name: Build (release, ${{ matrix.target.triple }})
+        run: cargo build --release --target ${{ matrix.target.triple }} --locked
+
+      - name: Test
+        run: cargo test --target ${{ matrix.target.triple }} --locked
+
+      - name: Mock-sidecar smoke (EN→ES, no real models)
+        shell: bash
+        run: |
+          set -eux
+          # Build a fake sidecar that speaks the JSON-per-line protocol
+          # without loading any model. Keeps wiring honest in CI without
+          # the 10 GB download.
+          mkdir -p "$LINGUACAST_SIDECAR_DIR"
+          cp scripts/mock_sidecar.py "$LINGUACAST_SIDECAR_DIR/main.py"
+
+          # Tiny mp4: 2 seconds of black with a 440 Hz sine. ffmpeg generates it.
+          ffmpeg -y -hide_banner -loglevel error \
+            -f lavfi -i "color=c=black:s=320x240:d=2" \
+            -f lavfi -i "sine=frequency=440:duration=2" \
+            -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest \
+            "${{ runner.temp }}/smoke.mp4"
+
+          # Pre-seed a consent record so the gate doesn't prompt.
+          mkdir -p "$LINGUACAST_HOME/consents"
+
+          # Run the dub. The mock sidecar bypasses consent by writing a 0-byte WAV
+          # only when invoked through op_run_dub; the real consent gate still runs.
+          # For CI we sign via consent file.
+          cat > "${{ runner.temp }}/consent.txt" <<'EOF'
+          I am the speaker in this audio, or I have written consent from the speaker.
+          signer: ci-bot
+          EOF
+
+          ./target/${{ matrix.target.triple }}/release/linguacast \
+            "${{ runner.temp }}/smoke.mp4" \
+            --langs es \
+            --i-have-speaker-consent "${{ runner.temp }}/consent.txt" \
+            --speaker-name "CI Bot" \
+            --device cpu \
+            --python "$(which python3)"
+
+          # The mock writes a stub MP4; verify the file exists.
+          test -s linguacast-out/smoke.es.mp4
+
+      - name: License audit (Rust deps)
+        if: matrix.target.name == 'linux-x64'
+        uses: EmbarkStudios/cargo-deny-action@v2
+        continue-on-error: true
+        with:
+          command: check licenses

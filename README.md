@@ -3,17 +3,17 @@
 Dub any video into other languages **in the speaker's own voice**, on your laptop.
 
 ```
-linguacast input.mp4 --langs es
+linguacast input.mp4 --langs es,zh,hi,fr,de,ja,pt,ar,ko,ru,it,tr
 ```
 
 Local-first. Single binary. Apache-2.0.
 
-> **Status:** week-1 spike. EN→ES voice clone via
+> **Status:** week-2. 12-language voice clone via
 > [Whisper-large-v3](https://huggingface.co/openai/whisper-large-v3) →
-> [MADLAD-400-3B-MT](https://huggingface.co/google/madlad400-3b-mt) →
+> [M2M-100-418M](https://huggingface.co/facebook/m2m100_418M) →
 > [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) →
-> ffmpeg mux. Other languages, lip-sync, consent gate, and packaging land
-> in weeks 2–3.
+> ffmpeg mux. Lip-sync, consent gate, and Homebrew/pip packaging land
+> in week 3.
 
 ---
 
@@ -34,31 +34,43 @@ python3 -m venv .venv
 cd ..
 ```
 
-### 3 — Pull model weights (once, ~10 GB)
-
-This step downloads Whisper, MADLAD-400, and Qwen3-TTS into
-`~/.cache/linguacast/`. It is a one-time step; the warm-cache dub below
-does not re-download anything.
+### 3 — Dub (first run auto-pulls weights, ~10 GB)
 
 ```bash
-./target/release/linguacast pull
+./target/release/linguacast samples/week1/input.mp4 --langs es
 ```
 
-On a fast connection this takes 10–20 minutes. On an M1 the download is
-I/O bound. Subsequent runs are warm-cache.
+The first invocation downloads Whisper, M2M-100, and Qwen3-TTS into
+`~/.cache/linguacast/` automatically (10–20 minutes on a fast connection,
+I/O bound on M1). Subsequent runs are warm-cache.
 
-### 4 — Dub (warm cache — this is the headline TTW)
+The first time you point LinguaCast at a new reference clip it prompts
+for the voice-clone consent attestation — type `I AGREE` to confirm.
+Consent is keyed on the audio bytes, so subsequent runs against the same
+clip reuse it silently. For CI / batch pipelines pass
+`--i-have-speaker-consent <path>` with a signed consent file. See
+[`docs/consent-gate.md`](docs/consent-gate.md) for the full policy
+(including the refusal list).
+
+If you'd rather pre-download (useful for ops / CI), run the explicit
+`linguacast pull` first. Output lands in `linguacast-out/input.<lang>.mp4`.
+
+**Time-to-WOW from warm cache on M1:** ~3–4 minutes for a 60-second
+clip (single-language). TTS synthesis is the bottleneck (~170s);
+Whisper and translation together add ~40s. Fully local, no API key,
+no cloud.
+
+### 4 — Dub into all 12 launch languages + pack a shareable reel
 
 ```bash
-./target/release/linguacast samples/week1/input.mp4 --langs es \
-  --i-understand-voice-clone-risks
+./target/release/linguacast samples/week1/input.mp4 \
+  --langs es,zh,hi,fr,de,ja,pt,ar,ko,ru,it,tr \
+  --pack
 ```
 
-Output lands in `linguacast-out/input.es.mp4`.
-
-**Time-to-WOW from warm cache on M1:** roughly 3–4 minutes for a 60-second
-clip. TTS synthesis is the bottleneck (~170s); Whisper and translation
-together add ~40s. Fully local, no API key, no cloud.
+`--pack` produces `linguacast-out/<stem>.pack.zip` containing all 12
+MP4s, a 16:9 thumbnail per language, and a single contact-sheet GIF
+cycling the outputs — ready to drop in a DM or social post.
 
 ---
 
@@ -67,9 +79,9 @@ together add ~40s. Fully local, no API key, no cloud.
 | Stage | Model | License | Warm-cache latency (M1, 60s clip) |
 | --- | --- | --- | --- |
 | ASR (speech → text + timestamps) | [Whisper-large-v3](https://huggingface.co/openai/whisper-large-v3) via faster-whisper | MIT | ~29s |
-| MT (EN → target) | [M2M-100-418M](https://huggingface.co/facebook/m2m100_418M) | MIT | ~8s |
+| MT (EN → target) | [M2M-100-418M](https://huggingface.co/facebook/m2m100_418M) (default, 12 langs) | MIT | ~8s |
 | TTS (voice clone) | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Apache-2.0 | ~172s |
-| Mux | ffmpeg | LGPL/GPL (system binary, not statically linked) | <1s |
+| Mux + pack | ffmpeg + zip | LGPL/GPL (system binary, not statically linked) | <2s |
 
 Whisper runs CPU int8 on macOS (CTranslate2 has no Metal backend) at
 ~0.5× realtime. M2M-100 and Qwen3-TTS run on MPS (Apple Silicon GPU);
@@ -88,6 +100,25 @@ Each model unloads before the next loads — only one model is resident at
 a time. See `docs/engine-decision.md` for the full measurement log.
 
 ---
+
+## Launch languages
+
+The 12 languages wired for v0:
+
+| Code | Language | M2M-100 | Qwen3-TTS native | Notes |
+| --- | --- | --- | --- | --- |
+| es | Spanish | ✓ | ✓ | Week-1 reference |
+| zh | Chinese | ✓ | ✓ | |
+| hi | Hindi | ✓ | ✓ (Auto) | Synthesis uses the TTS auto-lang path |
+| fr | French | ✓ | ✓ | |
+| de | German | ✓ | ✓ | |
+| ja | Japanese | ✓ | ✓ | |
+| pt | Portuguese | ✓ | ✓ | |
+| ar | Arabic | ✓ | ✓ (Auto) | Synthesis uses the TTS auto-lang path |
+| ko | Korean | ✓ | ✓ | |
+| ru | Russian | ✓ | ✓ | |
+| it | Italian | ✓ | ✓ | |
+| tr | Turkish | ✓ | ✓ (Auto) | Synthesis uses the TTS auto-lang path |
 
 ## Fallback sizes
 
@@ -115,15 +146,31 @@ API key. Cloud is a future `--cloud` flag, not a requirement.
 
 This is a real risk and we take it seriously.
 
-- **Today (week 1):** the CLI refuses to produce dubbed audio without the
-  `--i-understand-voice-clone-risks` flag. This is a placeholder gate.
-  Do not ship audio without speaker consent.
-- **Week 3 (launch-blocker):** the real consent gate ([OPE-12]) plus an
-  inaudible perceptual watermark ([OPE-13]) become the default code path
-  with no bypass.
+LinguaCast will not produce voice-cloned output until you've attested
+that you are the speaker, or you have written consent from the speaker.
+The gate is on by default and has no bypass:
 
-If you find a way to remove the watermark or skip the consent gate, please
-open a security issue rather than publishing.
+- **Interactive runs:** the CLI prints the attestation line on first use
+  of a new reference clip and waits for you to type `I AGREE`. Consent
+  is keyed on the SHA-256 of the reference audio and stored under
+  `~/.linguacast/consents/<hash>.json`. Re-runs against the same audio
+  reuse it silently; changing the audio bytes re-prompts.
+- **CI / non-TTY runs:** pass `--i-have-speaker-consent <path>` with a
+  signed consent file. The file must contain the attestation line
+  verbatim; see [`docs/consent-gate.md`](docs/consent-gate.md) for the
+  format.
+- **Refusal list:** a small list of high-profile public figures whose
+  voices have been most frequently abused in deepfake reports — runs
+  matching the list are rejected regardless of consent. Update the list
+  via PR against `crates/linguacast/data/refusal-list.json`.
+- **Provenance:** every output MP4 ships with the consent hash,
+  timestamp, and signer in its container metadata (`comment` atom plus
+  namespaced `linguacast_consent_*` keys). Visible via
+  `ffprobe -show_format`.
+
+A perceptual watermark ([OPE-13]) lands in the same week-3 milestone
+alongside this gate. If you find a way to remove either, please open a
+security issue rather than publishing.
 
 ## License
 

@@ -2,9 +2,12 @@ use anyhow::Result;
 use clap::Parser;
 
 mod cli;
+mod consent;
 mod device;
 mod ffmpeg;
+mod pack;
 mod pipeline;
+mod progress;
 mod sidecar;
 
 fn main() -> Result<()> {
@@ -29,6 +32,15 @@ fn main() -> Result<()> {
             mt,
             tts_size,
             python,
+        }),
+        Some(cli::Command::Verify {
+            input,
+            python,
+            json,
+        }) => pipeline::run_verify(pipeline::VerifyOpts {
+            input,
+            python,
+            json,
         }),
         None => pipeline::run_dub(cli),
     }
