@@ -56,8 +56,9 @@ I/O bound. Subsequent runs are warm-cache.
 
 Output lands in `linguacast-out/input.es.mp4`.
 
-**Time-to-WOW from warm cache on M1:** roughly 1–2 minutes for a 60-second
-clip (Whisper ~30s CPU int8, MADLAD ~TBD, Qwen3-TTS synthesis ~TBD).
+**Time-to-WOW from warm cache on M1:** roughly 3–4 minutes for a 60-second
+clip. TTS synthesis is the bottleneck (~170s); Whisper and translation
+together add ~40s. Fully local, no API key, no cloud.
 
 ---
 
@@ -65,23 +66,24 @@ clip (Whisper ~30s CPU int8, MADLAD ~TBD, Qwen3-TTS synthesis ~TBD).
 
 | Stage | Model | License | Warm-cache latency (M1, 60s clip) |
 | --- | --- | --- | --- |
-| ASR (speech → text + timestamps) | [Whisper-large-v3](https://huggingface.co/openai/whisper-large-v3) via faster-whisper | MIT | ~28s |
-| MT (EN → target) | [MADLAD-400-3B-MT](https://huggingface.co/google/madlad400-3b-mt) | Apache-2.0 | pending |
-| TTS (voice clone) | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Apache-2.0 | pending |
+| ASR (speech → text + timestamps) | [Whisper-large-v3](https://huggingface.co/openai/whisper-large-v3) via faster-whisper | MIT | ~29s |
+| MT (EN → target) | [M2M-100-418M](https://huggingface.co/facebook/m2m100_418M) | MIT | ~8s |
+| TTS (voice clone) | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Apache-2.0 | ~172s |
 | Mux | ffmpeg | LGPL/GPL (system binary, not statically linked) | <1s |
 
 Whisper runs CPU int8 on macOS (CTranslate2 has no Metal backend) at
-~0.5× realtime. MPS/CUDA for MADLAD and Qwen3-TTS; CPU fallback if
-unavailable.
+~0.5× realtime. M2M-100 and Qwen3-TTS run on MPS (Apple Silicon GPU);
+CPU fallback if unavailable.
 
-Memory peaks per stage (sequential load/unload, M1):
+Memory peaks per stage (sequential load/unload, M1 — measured 2026-05-19):
 
-| Stage | Peak RSS |
-| --- | --- |
-| Whisper large-v3 | ~3.8 GB |
-| MADLAD-400-3B-MT | pending |
-| Qwen3-TTS-1.7B-Base | pending |
+| Stage | Peak RSS | 8 GB M1 fit |
+| --- | --- | --- |
+| Whisper large-v3 | 3.86 GB | ✓ |
+| M2M-100-418M | 3.86 GB | ✓ |
+| Qwen3-TTS-1.7B-Base | 6.63 GB | ✓ (1.4 GB headroom) |
 
+Pipeline ceiling: **6.63 GB**. Confirmed under `memory_pressure -l critical`.
 Each model unloads before the next loads — only one model is resident at
 a time. See `docs/engine-decision.md` for the full measurement log.
 

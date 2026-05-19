@@ -536,7 +536,15 @@ def op_translate(payload: Dict[str, Any]) -> Dict[str, Any]:
     device = _resolve_torch_device(payload.get("device", "auto"))
 
     if not segments_in:
-        return {"kind": "translate", "segments": [], "model": MT_MODELS[mt_key]}
+        return {
+            "kind": "translate",
+            "segments": [],
+            "model": MT_MODELS[mt_key],
+            "stage_seconds": 0.0,
+            "translate_seconds": 0.0,
+            "peak_rss_mb": current_rss_mb(),
+            "current_rss_mb": current_rss_mb(),
+        }
 
     stage_t0 = time.time()
     model, tok, device_used, family = _load_mt(mt_key, device)
@@ -709,6 +717,20 @@ def op_run_dub(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     segments = asr_resp["segments"]
+    if not segments:
+        return {
+            "kind": "run_dub",
+            "out_audio_path": str(out_audio),
+            "duration_sec": target_duration,
+            "sample_rate": 24000,
+            "language": asr_resp.get("language", "unknown"),
+            "target_lang": target_lang,
+            "segments": 0,
+            "segments_rendered": 0,
+            "stages": stages,
+            "peak_rss_mb": stages[-1]["peak_rss_mb"] if stages else 0.0,
+            "warning": "no speech detected — output audio not written",
+        }
     ref_text = " ".join(s["text"] for s in segments).strip()
 
     # Stage 2: translate. Device routing per CTO ack (comment 73a125be):
