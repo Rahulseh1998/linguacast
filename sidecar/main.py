@@ -151,17 +151,29 @@ def _load_madlad(device: str):
     return _madlad_model, _madlad_tokenizer
 
 
+QWEN3_TTS_MODELS = {
+    # Voice cloning from a short reference clip. This is what the
+    # launch hook needs. 1.7B params → ~3.4 GB on disk in safetensors,
+    # comfortably under the M1 8 GB ceiling.
+    "qwen3-tts": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    # Prompt-based voice design (no clone). Kept as a knob in case the
+    # custom-voice repo has an outage; not the default.
+    "qwen3-tts-voicedesign": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+}
+
+
 def _load_tts(engine: str, device: str):
-    """Voice-clone TTS. Week-1 spike: Qwen3-TTS (Apache-2.0).
+    """Voice-clone TTS. Default: Qwen3-TTS-12Hz-1.7B-CustomVoice (Apache-2.0).
 
     The engine knob exists for the OPE-19 A/B test:
-      - qwen3-tts            full precision
-      - qwen3-tts-quantized  int8 / int4 for 8 GB targets
-      - voicebox             disabled this week pending license clearance
+      - qwen3-tts              CustomVoice 1.7B (voice cloning from ref clip)
+      - qwen3-tts-voicedesign  prompt-based voice (no clone) — fallback
+      - voicebox               disabled until license clears Apache/MIT floor
 
-    The actual loader is intentionally optimistic — if the model isn't
-    available we emit a clear, actionable error rather than synthesising
-    silence and pretending it worked.
+    Discovery note from OPE-19 week-1: the actual Hub IDs are
+    `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `…-VoiceDesign` (the bare
+    `Qwen/Qwen3-TTS` IDs we initially planned around do not exist).
+    At 1.7B params we don't need a quantized variant for the 8 GB target.
     """
     global _tts_engine_handle
     if _tts_engine_handle is not None and _tts_engine_handle[0] == engine:
@@ -169,33 +181,35 @@ def _load_tts(engine: str, device: str):
     log(f"loading tts engine {engine!r} on {device}…")
     if engine == "voicebox":
         raise SidecarError(
-            "Voicebox is intentionally disabled in week 1 pending an Apache-2.0 "
-            "/ MIT-floor license audit (the public release is CC-BY-NC). "
-            "Use --tts qwen3-tts or qwen3-tts-quantized."
+            "Voicebox is intentionally disabled pending an Apache-2.0 / MIT-floor "
+            "license audit (the 2023 release was research-only). Use --tts qwen3-tts."
         )
-    if engine not in ("qwen3-tts", "qwen3-tts-quantized"):
+    if engine == "qwen3-tts-quantized":
+        # We kept this knob in the CLI for the spike, but at 1.7B params
+        # the full-precision model already fits 8 GB. Quantization isn't
+        # required for the launch target, so we transparently alias it to
+        # the full-precision variant rather than maintaining a parallel
+        # quantized fork.
+        engine = "qwen3-tts"
+    if engine not in QWEN3_TTS_MODELS:
         raise SidecarError(f"unknown tts engine: {engine!r}")
-    # We avoid hard-coding the exact import path here because Qwen3-TTS is
-    # young and the API moved between releases. The first attempt below is
-    # the canonical path on Hugging Face; the helpful error tells the user
-    # how to recover if a refresh is needed.
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer  # pyright: ignore
+        from transformers import AutoModel, AutoProcessor  # pyright: ignore
     except Exception as exc:  # pragma: no cover — handled below
         raise SidecarError(
             f"transformers is required for tts but isn't importable: {exc}"
         ) from exc
-    model_id = (
-        "Qwen/Qwen3-TTS-Quantized"
-        if engine == "qwen3-tts-quantized"
-        else "Qwen/Qwen3-TTS"
-    )
+    model_id = QWEN3_TTS_MODELS[engine]
     log(
         f"  → if this hangs on first run, the model weights are downloading to {CACHE_ROOT / 'hf'}"
     )
     try:
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        mdl = AutoModelForCausalLM.from_pretrained(
+        # Qwen3-TTS ships a custom architecture (`qwen3_tts`); use AutoModel
+        # + trust_remote_code so transformers loads the model's own code.
+        processor = AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=True
+        )
+        mdl = AutoModel.from_pretrained(
             model_id,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
@@ -203,10 +217,10 @@ def _load_tts(engine: str, device: str):
     except Exception as exc:
         raise SidecarError(
             f"could not load {model_id}. The Qwen3-TTS Hub repo may have moved or "
-            f"requires a newer transformers release. Try `pip install -U transformers` "
-            f"or pin --tts qwen3-tts-quantized. Original error: {exc}"
+            f"requires a newer transformers release. Try `pip install -U transformers`. "
+            f"Original error: {exc}"
         ) from exc
-    _tts_engine_handle = (engine, (mdl, tok))
+    _tts_engine_handle = (engine, (mdl, processor))
     return _tts_engine_handle[1]
 
 

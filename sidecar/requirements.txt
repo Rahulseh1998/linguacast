@@ -14,6 +14,7 @@ torchaudio>=2.9,<2.13      # BSD-2-Clause
 transformers>=4.46,<5.0    # Apache-2.0  — MADLAD, Qwen3-TTS loaders (5.x has a Whisper-decode regression; revisit when it stabilizes)
 accelerate>=1.0,<2.0       # Apache-2.0
 sentencepiece>=0.2.0       # Apache-2.0  — required by MADLAD/T5 tokenizer
+protobuf>=4,<8             # BSD-3-Clause — required by SentencePiece tokenizer decode
 
 # Whisper-large-v3 via the original openai-whisper package. MIT.
 # We chose openai-whisper over the HF transformers pipeline because the
