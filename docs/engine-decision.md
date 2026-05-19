@@ -114,6 +114,12 @@ and is what the `peak_rss_mb` numbers in the pipeline JSON now report on
 Apple Silicon. CPU-only systems still report `ru_maxrss`; the gap matters
 only for MPS-resident models.
 
+For continuous sampling during a pipeline run, use
+[`scripts/poll_ioreg.sh`](../scripts/poll_ioreg.sh) — it logs the
+IOAccelerator alloc counter alongside `vm_stat` app/compressed/wired/free
+bytes every 2 s into a TSV, which is how the ceilings in this doc were
+measured.
+
 ### Stage 2: MT — engine choice
 
 **Selected: `facebook/m2m100_418M` (MIT)** — locked per CTO ack 2026-05-19
