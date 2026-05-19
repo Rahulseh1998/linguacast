@@ -163,14 +163,27 @@ The gate is on by default and has no bypass:
   voices have been most frequently abused in deepfake reports — runs
   matching the list are rejected regardless of consent. Update the list
   via PR against `crates/linguacast/data/refusal-list.json`.
-- **Provenance:** every output MP4 ships with the consent hash,
-  timestamp, and signer in its container metadata (`comment` atom plus
-  namespaced `linguacast_consent_*` keys). Visible via
-  `ffprobe -show_format`.
+- **Provenance — metadata:** every output MP4 ships with the consent
+  hash, timestamp, signer, LinguaCast version, and watermark id in its
+  container metadata (`comment` atom plus namespaced `linguacast_*`
+  keys). Visible via `ffprobe -show_format`.
+- **Provenance — audio watermark:** every voice-cloned audio track
+  carries an inaudible perceptual watermark (patchwork
+  spread-spectrum, 1 kHz–6 kHz band) encoding a 32-bit id derived
+  deterministically from the consent hash. The watermark survives
+  YouTube-style 1080p H.264 + AAC re-encode and `ffmpeg
+  -map_metadata -1` metadata stripping at **100% detection / 80% id
+  recovery** on the survival corpus
+  ([`docs/watermark.md`](docs/watermark.md)). It's the *load-bearing*
+  safety claim — metadata can be stripped; the audio watermark cannot.
 
-A perceptual watermark ([OPE-13]) lands in the same week-3 milestone
-alongside this gate. If you find a way to remove either, please open a
-security issue rather than publishing.
+```bash
+# Check whether a file is a LinguaCast output and recover its provenance:
+linguacast verify path/to/output.mp4
+```
+
+If you find a way to remove the watermark or skip the consent gate,
+please open a security issue rather than publishing.
 
 ## License
 

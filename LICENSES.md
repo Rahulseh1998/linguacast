@@ -75,6 +75,7 @@ authoritative list. Versions are pinned to permissive-licensed releases.
 | sentencepiece | Apache-2.0 | tokenizer for T5/MADLAD |
 | librosa | ISC | audio resampling |
 | numpy | BSD-3-Clause | linear algebra |
+| scipy | BSD-3-Clause | STFT/iSTFT for the OPE-13 perceptual watermark |
 | soundfile | BSD-3-Clause | WAV read/write |
 | huggingface-hub | Apache-2.0 | model download client |
 | tqdm | MIT or MPL-2.0 (dual) | first-run download progress |
@@ -86,6 +87,13 @@ authoritative list. Versions are pinned to permissive-licensed releases.
   fallback story. If we need int8 quantization we'll prefer `transformers`'
   built-in `bitsandbytes` integration *with explicit guardrails*, or move
   to GGUF.
+- **OSS perceptual audio watermark libraries** (`audiowmark`, `WavMark`,
+  `silentcipher`, `AudioSeal`) — every one surveyed at the time of OPE-13
+  landing failed the Apache-2.0 / MIT floor (GPL-2.0, research-only, or
+  source-restricted). `sidecar/watermark.py` is a clean-room
+  implementation of the public-domain Patchwork algorithm (Bender et al.,
+  IBM Systems Journal 1996) — Apache-2.0, depends only on numpy + scipy.
+  See [`docs/watermark.md`](docs/watermark.md).
 
 ## System binaries (not bundled)
 

@@ -388,54 +388,141 @@ pub struct VerifyOpts {
 }
 
 pub fn run_verify(opts: VerifyOpts) -> Result<()> {
+    if !opts.input.exists() {
+        return Err(anyhow!("input file not found: {}", opts.input.display()));
+    }
     let sidecar_dir = locate_sidecar_dir()?;
     let mut sidecar = sidecar::Sidecar::launch(opts.python.as_deref(), &sidecar_dir)
         .map_err(humanize)?;
     sidecar.hello().map_err(humanize)?;
 
-    // Extract a 24 kHz mono WAV from the input so the watermark detector
-    // sees the same sample rate the embedder wrote at.
-    let work = tempfile::tempdir().context("creating temp working dir")?;
+    // Extract a 24 kHz mono WAV — the rate the watermark embedder wrote at,
+    // so the detector sees identical frequency-bin mapping.
+    let work = tempfile::tempdir().context("creating verify work dir")?;
     let candidate_wav = work.path().join("candidate-24k-mono.wav");
     ffmpeg::extract_audio_24k_mono(&opts.input, &candidate_wav).map_err(humanize)?;
 
+    // Container metadata (may be stripped — the watermark is load-bearing,
+    // metadata is convenience). Probe is best-effort: a verifier that can't
+    // read tags still emits a meaningful report.
+    let meta = ffmpeg::probe_metadata(&opts.input).unwrap_or(serde_json::json!({}));
+    let format_tags = meta
+        .get("format")
+        .and_then(|f| f.get("tags"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
     let report = sidecar.verify(&candidate_wav).map_err(humanize)?;
+
+    let meta_wm_id = format_tags
+        .get("linguacast_watermark_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_lowercase);
+    let audio_wm_id = report.watermark_id.as_deref().map(str::to_lowercase);
+    let metadata_audio_match = match (&meta_wm_id, &audio_wm_id) {
+        (Some(m), Some(a)) => Some(m == a),
+        _ => None,
+    };
+
     if opts.json {
         let v = serde_json::json!({
-            "file": opts.input.display().to_string(),
-            "detected": report.detected,
-            "confidence": report.confidence,
-            "watermark_id": report.watermark_id,
-            "version": report.version,
-            "crc_ok": report.crc_ok,
-            "repeats_voted": report.repeats_voted,
-            "bit_offset_frames": report.bit_offset_frames,
-            "sample_rate": report.sample_rate,
-            "duration_sec": report.duration_sec,
-            "elapsed_sec": report.elapsed_sec,
-            "algorithm": report.algorithm,
+            "input": opts.input.display().to_string(),
+            "watermark": {
+                "detected": report.detected,
+                "confidence": report.confidence,
+                "watermark_id": report.watermark_id,
+                "version": report.version,
+                "crc_ok": report.crc_ok,
+                "repeats_voted": report.repeats_voted,
+                "bit_offset_frames": report.bit_offset_frames,
+                "sample_rate": report.sample_rate,
+                "duration_sec": report.duration_sec,
+                "elapsed_sec": report.elapsed_sec,
+                "algorithm": report.algorithm,
+            },
+            "metadata": format_tags,
+            "metadata_audio_match": metadata_audio_match,
         });
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
-        println!("File: {}", opts.input.display());
-        println!(
-            "Watermark: {} (confidence {:.2})",
-            if report.detected { "DETECTED" } else { "not detected" },
-            report.confidence
-        );
-        if let Some(id) = &report.watermark_id {
-            println!("  watermark_id: {id}");
-        }
-        if let Some(v) = report.version {
-            println!("  version:      0x{v:02x}");
-        }
-        if let Some(c) = report.crc_ok {
-            println!("  crc_ok:       {c}");
-        }
-        println!("  repeats voted: {}", report.repeats_voted);
-        println!("  algorithm:    {}", report.algorithm);
+        print_verify_human(&opts.input, &report, &format_tags, metadata_audio_match);
     }
+
     Ok(())
+}
+
+fn print_verify_human(
+    input: &Path,
+    r: &sidecar::VerifyReport,
+    meta_tags: &serde_json::Value,
+    metadata_audio_match: Option<bool>,
+) {
+    println!("LinguaCast verify — {}", input.display());
+    println!();
+    println!("Audio watermark");
+    println!(
+        "  detected      : {}",
+        if r.detected { "yes" } else { "no" }
+    );
+    println!("  confidence    : {:.3}", r.confidence);
+    if let Some(id) = &r.watermark_id {
+        println!("  watermark id  : {id}");
+    }
+    if let Some(v) = r.version {
+        println!("  version byte  : 0x{:02x}", v as u8);
+    }
+    if let Some(ok) = r.crc_ok {
+        println!("  crc           : {}", if ok { "ok" } else { "BAD" });
+    }
+    println!("  repeats voted : {}", r.repeats_voted);
+    println!("  sample rate   : {} Hz", r.sample_rate);
+    println!("  audio duration: {:.2} s", r.duration_sec);
+    println!("  detect time   : {:.3} s", r.elapsed_sec);
+    println!("  algorithm     : {}", r.algorithm);
+
+    println!();
+    println!("Container metadata (ID3/XMP-style, may be stripped)");
+    if let Some(map) = meta_tags.as_object() {
+        if map.is_empty() {
+            println!("  (no metadata tags — may have been stripped)");
+        } else {
+            for (k, v) in map {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                println!("  {k:30} : {s}");
+            }
+        }
+    } else {
+        println!("  (no metadata block)");
+    }
+
+    println!();
+    match metadata_audio_match {
+        Some(true) => println!(
+            "Provenance: ✓ audio watermark id matches the linguacast_watermark_id in metadata."
+        ),
+        Some(false) => println!(
+            "Provenance: ✗ MISMATCH — the watermark id recovered from audio differs from \
+             the linguacast_watermark_id claimed in metadata. The metadata may have been \
+             tampered with, or the audio was re-muxed under a different LinguaCast output's tags."
+        ),
+        None => {
+            if r.detected {
+                println!(
+                    "Provenance: watermark detected, metadata id missing (likely stripped by \
+                     `ffmpeg -map_metadata -1`). The audio bit-payload still identifies this as \
+                     LinguaCast-generated."
+                );
+            } else {
+                println!(
+                    "Provenance: no LinguaCast watermark detected. This is either not a \
+                     LinguaCast output, or the audio has been heavily re-processed."
+                );
+            }
+        }
+    }
 }
 
 fn pick_tts_engine(cli: &Cli) -> &'static str {
