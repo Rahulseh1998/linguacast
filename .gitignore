@@ -1,0 +1,43 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Python sidecar
+sidecar/.venv/
+sidecar/**/__pycache__/
+sidecar/**/*.pyc
+*.egg-info/
+.eggs/
+
+# Model + intermediate caches (lazy-downloaded; never committed)
+.cache/
+~/.cache/linguacast/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+dist/
+build/
+
+# Sample I/O (we commit small canonical sample only; reject large clips)
+samples/*/scratch/
+*.wav
+*.aac
+*.m4a
+# Keep canonical input/output mp4 under samples/week1/
+!samples/week1/input.mp4
+!samples/week1/output-es.mp4
