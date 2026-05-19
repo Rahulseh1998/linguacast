@@ -33,6 +33,9 @@ Thumbs.db
 dist/
 build/
 
+# CLI output dir (per-run dub artifacts; never committed)
+linguacast-out/
+
 # Sample I/O (we commit small canonical sample only; reject large clips)
 samples/*/scratch/
 *.wav
