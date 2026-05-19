@@ -46,10 +46,11 @@ pub struct Cli {
     #[arg(long, default_value = "large-v3")]
     pub asr: AsrModel,
 
-    /// Override the MT (translation) model. Default: `3b` (MADLAD-400-3B-MT).
-    /// Switching MT family requires a license-floor escalation — see
-    /// `docs/engine-decision.md`.
-    #[arg(long, default_value = "3b")]
+    /// Override the MT (translation) model. Default: `m2m100-418m`
+    /// (facebook/m2m100_418M, MIT, ~5 GB peak — fits 8 GB M1). Opt-in
+    /// `madlad-3b` is available for ≥16 GB hosts. See
+    /// `docs/engine-decision.md` for the fit measurements.
+    #[arg(long, default_value = "m2m100-418m")]
     pub mt: MtModel,
 
     /// Override the TTS engine. Default: qwen3-tts. Voicebox is wired but
@@ -82,8 +83,8 @@ pub enum Command {
         #[arg(long, default_value = "large-v3")]
         asr: AsrModel,
 
-        /// MT model to pull. Default: `3b`.
-        #[arg(long, default_value = "3b")]
+        /// MT model to pull. Default: `m2m100-418m`.
+        #[arg(long, default_value = "m2m100-418m")]
         mt: MtModel,
 
         /// TTS size to pull. Default: `1.7B`.
@@ -156,22 +157,25 @@ impl AsrModel {
     }
 }
 
-/// MADLAD-400 variant. Only 3B and 10B are public Apache-2.0; sub-3B
-/// public MADLADs are research-only, so 3B is effectively the floor.
+/// MT model registry. `m2m100-418m` (MIT, ~5 GB peak) is the default and
+/// fits the 8 GB M1 ceiling. `madlad-3b` (Apache-2.0, ~6 GB CPU bf16) is
+/// the opt-in upgrade for ≥16 GB hosts. NLLB is rejected (CC-BY-NC). The
+/// `MADLAD-400-1B` variant referenced in the CTO ack fallback list does
+/// not exist as a public Apache-2.0 release (verified 2026-05-19).
 #[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
-#[clap(rename_all = "lowercase")]
+#[clap(rename_all = "kebab-case")]
 pub enum MtModel {
-    #[clap(name = "3b")]
+    M2M100418M,
     Madlad3B,
-    #[clap(name = "10b")]
     Madlad10B,
 }
 
 impl MtModel {
     pub fn as_str(&self) -> &'static str {
         match self {
-            MtModel::Madlad3B => "3b",
-            MtModel::Madlad10B => "10b",
+            MtModel::M2M100418M => "m2m100-418m",
+            MtModel::Madlad3B => "madlad-3b",
+            MtModel::Madlad10B => "madlad-10b",
         }
     }
 }

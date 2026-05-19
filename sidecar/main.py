@@ -206,6 +206,12 @@ def _resolve_torch_device(requested: str) -> str:
         return "mps"
     if requested == "cuda" and torch.cuda.is_available():
         return "cuda"
+    if requested == "auto":
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
     if requested in ("mps", "cuda"):
         log(f"requested device {requested!r} not available; falling back to cpu")
     return "cpu"
@@ -249,48 +255,97 @@ def _load_whisper(size: str) -> Any:
 
 # --- MT: MADLAD-400 --------------------------------------------------------
 
-def _load_madlad(size: str, device: str) -> Tuple[Any, Any]:
-    """Load MADLAD-400 (3B or 1B) on `device`. Sequential-load aware."""
-    _unload_if_other("madlad")
-    if _loaded_stage == "madlad":
+def _load_mt(mt_key: str, device: str) -> Tuple[Any, Any, str, str]:
+    """Load an MT model on `device`. Returns (model, tokenizer, device, family).
+
+    family is "m2m100" or "madlad" — the translate loop picks the right API
+    based on the family.
+    """
+    _unload_if_other("mt")
+    if _loaded_stage == "mt":
         return _loaded_handle
-    model_id = MADLAD_MODELS.get(size)
-    if model_id is None:
-        raise SidecarError(f"unknown madlad size: {size!r} (use '3b' or '1b')")
+    key = _mt_resolve(mt_key)
+    model_id = MT_MODELS[key]
+    family = "m2m100" if key.startswith("m2m100") else "madlad"
     log(f"loading {model_id} on {device}…")
     import torch  # pyright: ignore
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # pyright: ignore
 
+    # Dtype rules:
+    #  - M2M-100 is ~418M params; fp32 fits everywhere, no instability issues.
+    #  - MADLAD-3B + MPS + fp16 trips the T5 multinomial sampler (repetition
+    #    loops). CPU bf16 is the documented MADLAD-on-8GB-M1 path: 3B × 2B
+    #    ≈ 6 GB resident + activations, fits 8 GB. CUDA gets bf16.
     if device == "cuda":
         dtype = torch.bfloat16
-    elif device == "mps":
-        # MADLAD on MPS: bf16 works on M2/M3, but M1 has had intermittent
-        # NaN reports with bf16. fp16 is the safe default for the launch
-        # hook and matches what faster-whisper uses on the same hardware.
-        dtype = torch.float16
+    elif family == "madlad" and device == "cpu":
+        dtype = torch.bfloat16  # CTO-approved CPU bf16 path for MADLAD-3B
+    elif family == "madlad":
+        dtype = torch.float32   # MPS MADLAD: fp32 only
     else:
-        dtype = torch.float32
-    tok = AutoTokenizer.from_pretrained(model_id)
-    mdl = AutoModelForSeq2SeqLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    ).to(device)
-    handle = (mdl, tok, device)
-    _set_loaded("madlad", handle)
+        dtype = torch.float32   # M2M-100 fp32
+
+    # `device_map={"": device}` loads directly into the target device via
+    # accelerate, avoiding the CPU↔MPS double-allocation spike that
+    # `.to(device)` would cause. CUDA handles device placement natively.
+    device_map = None if device == "cuda" else {"": device}
+
+    if family == "m2m100":
+        from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer  # pyright: ignore
+        tok = M2M100Tokenizer.from_pretrained(model_id)
+        if device_map is not None:
+            mdl = M2M100ForConditionalGeneration.from_pretrained(
+                model_id, dtype=dtype, device_map=device_map, low_cpu_mem_usage=True,
+            )
+        else:
+            mdl = M2M100ForConditionalGeneration.from_pretrained(
+                model_id, dtype=dtype, low_cpu_mem_usage=True,
+            ).to(device)
+    else:
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # pyright: ignore
+        tok = AutoTokenizer.from_pretrained(model_id)
+        if device_map is not None:
+            mdl = AutoModelForSeq2SeqLM.from_pretrained(
+                model_id, dtype=dtype, device_map=device_map, low_cpu_mem_usage=True,
+            )
+        else:
+            mdl = AutoModelForSeq2SeqLM.from_pretrained(
+                model_id, dtype=dtype, low_cpu_mem_usage=True,
+            ).to(device)
+
+    handle = (mdl, tok, device, family)
+    _set_loaded("mt", handle)
     return handle
 
 
-# MADLAD-400 family (all Apache-2.0). The CTO ack pre-approved `madlad-1b`
-# as the fallback if 3B doesn't fit, but Google's only sub-3B public MADLAD
-# release is on a non-Apache license (MADLAD-Base is research-only). For
-# the launch hook we keep `3b` as the only registry entry; if 3B OOMs the
-# real fallback is to switch MT families entirely, and that escalates back
-# to the CTO per the rubric in `docs/engine-decision.md`.
-MADLAD_MODELS = {
-    "3b": "google/madlad400-3b-mt",
-    "10b": "google/madlad400-10b-mt",
+# MT model registry. M2M-100-418M (MIT) is the default for 8 GB M1 fit
+# (CTO ack 2026-05-19 comment 73a125be). MADLAD-3B stays exposed as opt-in
+# for ≥16 GB users. Family note: M2M-100 is MIT-licensed; NLLB (its sibling
+# Facebook model) is CC-BY-NC and is rejected by the license allowlist. Do
+# not confuse the two.
+MT_MODELS = {
+    "m2m100-418m": "facebook/m2m100_418M",      # MIT, ~5 GB peak (default)
+    "madlad-3b":   "google/madlad400-3b-mt",    # Apache-2.0, ~11 GB MPS / ~6 GB CPU bf16
+    "madlad-10b":  "google/madlad400-10b-mt",   # Apache-2.0, won't fit 8 GB
 }
+
+# Legacy alias map for the `mt` payload field. Accepts the old "3b"/"10b"
+# shorthand and the new full slugs.
+MT_ALIASES = {
+    "3b": "madlad-3b",
+    "10b": "madlad-10b",
+    "madlad": "madlad-3b",
+    "m2m100": "m2m100-418m",
+}
+
+
+def _mt_resolve(mt_size: str) -> str:
+    """Translate the public --mt key into a model id."""
+    key = MT_ALIASES.get(mt_size, mt_size)
+    if key not in MT_MODELS:
+        raise SidecarError(
+            f"unknown mt model {mt_size!r}; supported: {sorted(MT_MODELS)}"
+        )
+    return key
 
 
 # --- TTS: qwen-tts wrapping Qwen3-TTS-12Hz-1.7B-Base ----------------------
@@ -342,12 +397,23 @@ def _load_qwen_tts(size: str, device: str) -> Any:
     else:
         dtype = torch.float32
 
+    # snapshot_download forces all files (including speech_tokenizer/preprocessor_config.json
+    # and safetensors weights) to be present before from_pretrained is called.
+    # The qwen-tts package's internal download path skips subdirectory configs.
+    from huggingface_hub import snapshot_download  # pyright: ignore
+    hf_cache = str(CACHE_ROOT / "hf")
+    local_dir = snapshot_download(
+        repo_id=model_id,
+        cache_dir=hf_cache,
+        ignore_patterns=["*.msgpack", "*.h5", "flax_model*", "tf_model*"],
+    )
+    log(f"Qwen3-TTS snapshot at {local_dir}")
+
     model = Qwen3TTSModel.from_pretrained(
-        model_id,
+        local_dir,
         device_map=device,
         dtype=dtype,
         attn_implementation="sdpa",  # flash-attn is CUDA-only
-        cache_dir=str(CACHE_ROOT / "models" / "qwen3-tts"),
     )
     handle = (model, size)
     _set_loaded("tts", handle)
@@ -385,18 +451,18 @@ def op_pull(payload: Dict[str, Any]) -> Dict[str, Any]:
     cold downloads stay separate from the warm-cache run.
     """
     asr = payload.get("asr", "large-v3")
-    mt_size = payload.get("mt", "3b")
+    mt_key = _mt_resolve(payload.get("mt", "m2m100-418m"))
     tts_size = payload.get("tts", "1.7B")
-    log(f"pull: asr={asr} mt={mt_size} tts={tts_size}")
+    log(f"pull: asr={asr} mt={mt_key} tts={tts_size}")
 
     # Whisper download. faster-whisper download is implicit in WhisperModel(),
     # so we load + unload as the simplest way to force the fetch.
     _ = _load_whisper(asr)
     _unload_if_other("__none__")  # force unload
 
-    # MADLAD download. transformers caches under HF_HOME.
+    # MT download. transformers caches under HF_HOME.
     device = _resolve_torch_device("cpu")  # CPU just to force the fetch
-    _ = _load_madlad(mt_size, device)
+    _ = _load_mt(mt_key, device)
     _unload_if_other("__none__")
 
     # Qwen3-TTS download. qwen-tts uses HF caching as well.
@@ -409,7 +475,7 @@ def op_pull(payload: Dict[str, Any]) -> Dict[str, Any]:
         "cache_root": cache_root,
         "models": {
             "asr": f"whisper-{asr}",
-            "mt": MADLAD_MODELS[mt_size],
+            "mt": MT_MODELS[mt_key],
             "tts": f"Qwen/Qwen3-TTS-12Hz-{tts_size}-Base",
         },
     }
@@ -462,38 +528,59 @@ def op_transcribe(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def op_translate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """MT via MADLAD-400. Loads → runs → unloads."""
+    """MT via M2M-100 or MADLAD. Loads → runs → unloads."""
     segments_in: List[Dict[str, Any]] = payload["segments"]
     source_lang: str = payload.get("source_lang", "en")
     target_lang: str = payload["target_lang"]
-    mt_size = payload.get("mt", "3b")
-    device = _resolve_torch_device(payload.get("device", "cpu"))
+    mt_key = _mt_resolve(payload.get("mt", "m2m100-418m"))
+    device = _resolve_torch_device(payload.get("device", "auto"))
 
     if not segments_in:
-        return {"kind": "translate", "segments": [], "model": MADLAD_MODELS[mt_size]}
+        return {"kind": "translate", "segments": [], "model": MT_MODELS[mt_key]}
 
     stage_t0 = time.time()
-    model, tok, device_used = _load_madlad(mt_size, device)
+    model, tok, device_used, family = _load_mt(mt_key, device)
 
-    log(f"translating {len(segments_in)} segments {source_lang} → {target_lang}…")
-    target_token = f"<2{target_lang}>"
+    log(f"translating {len(segments_in)} segments {source_lang} → {target_lang} via {family}…")
     out_segments: List[Dict[str, Any]] = []
     t0 = time.time()
-    for seg in segments_in:
-        prompt = f"{target_token} {seg['text']}"
-        inputs = tok(prompt, return_tensors="pt").to(device_used)
-        with _torch_module().inference_mode():
-            generated = model.generate(
-                **inputs,
-                max_new_tokens=256,
-                num_beams=4,
+
+    if family == "m2m100":
+        tok.src_lang = source_lang
+        forced_bos = tok.get_lang_id(target_lang)
+        for seg in segments_in:
+            inputs = tok(seg["text"], return_tensors="pt").to(device_used)
+            with _torch_module().inference_mode():
+                generated = model.generate(
+                    **inputs,
+                    forced_bos_token_id=forced_bos,
+                    max_new_tokens=256,
+                    num_beams=4,
+                )
+            translated = tok.batch_decode(generated, skip_special_tokens=True)[0].strip()
+            out_segments.append(
+                {"start": seg["start"], "end": seg["end"], "text": translated}
             )
-        translated = tok.decode(generated[0], skip_special_tokens=True).strip()
-        out_segments.append(
-            {"start": seg["start"], "end": seg["end"], "text": translated}
-        )
+    else:
+        target_token = f"<2{target_lang}>"
+        for seg in segments_in:
+            prompt = f"{target_token} {seg['text']}"
+            inputs = tok(prompt, return_tensors="pt").to(device_used)
+            with _torch_module().inference_mode():
+                generated = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    num_beams=4,
+                    no_repeat_ngram_size=4,
+                    repetition_penalty=1.3,
+                )
+            translated = tok.decode(generated[0], skip_special_tokens=True).strip()
+            out_segments.append(
+                {"start": seg["start"], "end": seg["end"], "text": translated}
+            )
+
     translate_secs = time.time() - t0
-    log(f"  madlad took {translate_secs:.2f}s")
+    log(f"  {family} took {translate_secs:.2f}s")
 
     peak_mb = peak_rss_mb_since_reset()
     rss_mb = current_rss_mb()
@@ -506,7 +593,7 @@ def op_translate(payload: Dict[str, Any]) -> Dict[str, Any]:
         "translate_seconds": translate_secs,
         "peak_rss_mb": peak_mb,
         "current_rss_mb": rss_mb,
-        "model": MADLAD_MODELS[mt_size],
+        "model": MT_MODELS[mt_key],
     }
 
 
@@ -524,7 +611,7 @@ def op_tts(payload: Dict[str, Any]) -> Dict[str, Any]:
     target_duration: float = float(payload.get("target_duration_sec", 0.0))
     ref_text: str = (payload.get("ref_text") or "").strip()
     tts_size: str = payload.get("tts_size", os.environ.get("LINGUACAST_TTS_SIZE", "1.7B"))
-    device = _resolve_torch_device(payload.get("device", "cpu"))
+    device = _resolve_torch_device(payload.get("device", "auto"))
 
     if not reference.exists():
         raise SidecarError(f"reference audio not found: {reference}")
@@ -604,9 +691,9 @@ def op_run_dub(payload: Dict[str, Any]) -> Dict[str, Any]:
     out_audio: Path = Path(payload["out_audio_path"])
     target_duration: float = float(payload.get("target_duration_sec", 0.0))
     asr_size = payload.get("asr", "large-v3")
-    mt_size = payload.get("mt", "3b")
+    mt_key = _mt_resolve(payload.get("mt", "m2m100-418m"))
     tts_size = payload.get("tts_size", os.environ.get("LINGUACAST_TTS_SIZE", "1.7B"))
-    device = _resolve_torch_device(payload.get("device", "cpu"))
+    device = _resolve_torch_device(payload.get("device", "auto"))
 
     stages: List[Dict[str, Any]] = []
 
@@ -624,14 +711,18 @@ def op_run_dub(payload: Dict[str, Any]) -> Dict[str, Any]:
     segments = asr_resp["segments"]
     ref_text = " ".join(s["text"] for s in segments).strip()
 
-    # Stage 2: translate
+    # Stage 2: translate. Device routing per CTO ack (comment 73a125be):
+    #  - M2M-100-418M (default): ~5 GB peak, fits MPS with headroom.
+    #  - MADLAD-3B (opt-in): forced to CPU with bf16; MPS path needs ~11 GB
+    #    and OOMs on 8 GB M1.
+    mt_device = "cpu" if mt_key.startswith("madlad") else device
     mt_resp = op_translate(
         {
             "segments": segments,
             "source_lang": asr_resp["language"],
             "target_lang": target_lang,
-            "mt": mt_size,
-            "device": device,
+            "mt": mt_key,
+            "device": mt_device,
         }
     )
     stages.append(

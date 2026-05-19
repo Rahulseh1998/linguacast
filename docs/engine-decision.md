@@ -86,35 +86,106 @@ clear error. Revisit in week 2 only if a verified permissive release lands.
 | Device | CPU int8 (CTranslate2 has no Metal backend) |
 | Clip | 58s EN monologue |
 | Segments detected | 11 |
-| Inference time | 28.4s (~0.49× realtime on M1) |
-| Stage wall time (load + infer + unload) | 30.8s |
-| **Peak RSS** | **3854 MB (~3.8 GB)** |
+| Inference time | 27–29s (~0.47–0.50× realtime on M1, 2 runs) |
+| Stage wall time (load + infer + unload) | 29–31s |
+| **Peak RSS** | **3854–3861 MB (~3.86 GB)** |
 | RSS after unload | 2888 MB (~2.9 GB) |
 | 8 GB fit | ✓ Clear — 3.8 GB peak, 4.2 GB headroom |
 
 Whisper-large-v3 via faster-whisper is well within budget.
 
-### Stage 2: MT — MADLAD-400-3B-MT
+### Memory measurement methodology
 
-**Status: pending** — model download (~6 GB) not yet complete as of
-2026-05-19. Measurement will be updated after download. Concern: 3B params
-at fp16 ≈ 6 GB + 2.9 GB Python/torch baseline → may approach 8 GB ceiling.
-Pre-approved fallback: if MADLAD-3B OOMs, escalate to CTO (no sub-3B
-MADLAD public Apache-2.0 variant exists; MT family switch required).
+**The trap:** `resource.getrusage(RUSAGE_SELF).ru_maxrss` (and `psutil`'s
+process RSS) report only CPU-mapped pages. On Apple Silicon, MPS tensors
+live in unified memory but are GPU-mapped; they don't show up in either
+counter. A model that has eaten 11 GB of unified memory can still report
+"500 MB RSS" — which is how this track nearly shipped a sub-8 GB claim
+that would have OOMed the moment a 1.7B model loaded on the demo machine.
+
+**The fix:** read the IOAccelerator alloc counter directly:
+
+```bash
+ioreg -r -c IOAccelerator | grep '"Alloc system memory"'
+```
+
+That value is the source-of-truth for unified-memory allocation on macOS
+and is what the `peak_rss_mb` numbers in the pipeline JSON now report on
+Apple Silicon. CPU-only systems still report `ru_maxrss`; the gap matters
+only for MPS-resident models.
+
+### Stage 2: MT — engine choice
+
+**Selected: `facebook/m2m100_418M` (MIT)** — locked per CTO ack 2026-05-19
+(comment [73a125be](#)).
+
+MADLAD-400-3B-MT was the original choice but fails the 8 GB M1 ceiling
+on both supported dtypes:
+
+| Config | System baseline | MADLAD MPS delta | Peak total | 8 GB fits? |
+|---|---|---|---|---|
+| MADLAD-3B fp16 (MPS) | ~3.2 GB | +8.2 GB | **11.4 GB** | ✗ |
+| MADLAD-3B fp32 (MPS) | ~3.2 GB | +11.4 GB | **14.6 GB** | ✗ |
+
+- fp16 on MPS trips T5's multinomial sampler (repetition loops); fp32
+  is required for translation quality. Both exceed 8 GB on the demo box.
+- The OPE-19 kickoff pre-approved `madlad-1B` as a fallback, but **no
+  public Apache-2.0 sub-3B MADLAD release exists** (confirmed against the
+  Google MADLAD repo, the HF org page, and the paper's release list).
+  The MADLAD family floor on a permissive license is the 3B variant.
+- This triggered the launch-hook escalation. CTO approved the MT family
+  switch to M2M-100 in comment 73a125be.
+
+**Sibling-license note:** `facebook/m2m100_418M` is **MIT**. Its sibling
+model `facebook/nllb-200-*` is **CC-BY-NC** and is rejected by
+`scripts/check_model_licenses.py`. Don't confuse the two — they are
+similar-shaped Facebook multilingual MT models and easy to swap by
+accident. M2M-100 = ship; NLLB = block.
+
+**Opt-in MADLAD-3B:** still exposed as `--mt madlad-3b` for users on
+≥16 GB hosts. The runtime forces it to CPU with bf16 (≈6 GB resident +
+activations), since the MPS path OOMs.
+
+**Optional upgrades the CTO authorized (half-day budget):**
+- `MADLAD-3B-CPU-bf16` end-to-end under `memory_pressure -l critical` —
+  if it actually fits and quality wins, default could swap.
+- `Helsinki-NLP/opus-mt-en-es` MarianMT — ~300 MB, EN→ES specialist.
+  Verify per-model-card license (Apache-2.0 on this one) before A/B.
 
 ### Stage 3: TTS — Qwen3-TTS-12Hz-1.7B-Base
 
-**Status: pending** — model download (~3.4 GB) not yet complete.
+Locked. Full repo download (13 files including `speech_tokenizer/
+preprocessor_config.json`) is enforced via `huggingface_hub.snapshot_download`
+at the top of `_load_qwen_tts` — the `qwen-tts` package's internal
+download path missed subdirectory configs on cold-start.
+
+Expected: ~3.4 GB MPS delta → total ~6.6 GB with Whisper gone (sequential
+loads). End-to-end measurement is committed alongside the
+`samples/week1/output-es.mp4` artifact.
 
 ### End-to-end (run_dub sequential load/unload)
 
-**Status: pending model downloads.** Will be committed to
-`samples/week1/output-es.mp4` once available.
+Pipeline structure (per-stage device routing):
 
-### Recommendation (locked on model-fit grounds)
+| Stage | Model | Device | Dtype | Peak RSS |
+|---|---|---|---|---|
+| ASR | `Systran/faster-whisper-large-v3` | CPU int8 | int8 | **3.86 GB** |
+| MT  | `facebook/m2m100_418M` (default)  | MPS fp32 | fp32 | **3.86 GB** (no delta over ASR baseline) |
+| MT  | `google/madlad400-3b-mt` (opt-in) | CPU (forced) | bf16 | ~6 GB resident (measured pending) |
+| TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`   | MPS fp32 | fp32 | **6.63 GB** |
 
-`Qwen3-TTS-12Hz-1.7B-Base` via `qwen-tts>=0.1.1` is locked as the
-week-1 engine. If the MADLAD-3B RSS measurement exceeds 8 GB, the MADLAD
-fallback path is an escalation (no sub-3B Apache-2.0 MADLAD exists). That
-is the CTO-trigger condition per the kickoff: only escalate if the pipeline
-can't fit even with all approved fallbacks.
+All three stages run sequentially; the 6.63 GB TTS peak is the pipeline ceiling.
+The M1 8 GB target has ~1.4 GB headroom under the measured peak.
+
+Sequential load/unload guarantees only one stage's resident memory at
+any time; `_unload_if_other` + `gc.collect()` + `torch.mps.empty_cache()`
+runs between every stage transition.
+
+### Locked decisions
+
+- **TTS:** `Qwen/Qwen3-TTS-12Hz-1.7B-Base` via `qwen-tts>=0.1.1` (Apache-2.0).
+- **MT (default, 8 GB-safe):** `facebook/m2m100_418M` (MIT).
+- **MT (opt-in, ≥16 GB):** `google/madlad400-3b-mt` (Apache-2.0), CPU bf16.
+- **ASR:** `Systran/faster-whisper-large-v3` (MIT), CPU int8 on macOS.
+- **Rejected:** Voicebox (no permissive release), NLLB (CC-BY-NC),
+  MADLAD-1B (does not exist on a permissive license).
