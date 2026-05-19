@@ -85,16 +85,19 @@ HOP: int = 512
 EMBED_BAND_LO_HZ: float = 1000.0
 EMBED_BAND_HI_HZ: float = 6000.0
 
-# Default embedding strength. Tuned on TTS output: α=0.12 ≈ 1 dB swing
-# per partition, which is below the ear's just-noticeable difference on
-# speech mid-band and above AAC-192 quantization noise. The survival
-# corpus on OPE-13 measures the floor.
-DEFAULT_ALPHA: float = 0.12
+# Default embedding strength. α=0.20 ≈ ~1.8 dB swing per partition,
+# tuned on the OPE-13 survival corpus against real speech (not synthetic
+# tones). At α=0.12 the watermark was detected on 100% of speech under
+# 1080p H.264 + AAC re-encode but the 32-bit id payload took 4-5 bit
+# flips per pass; bumping to 0.20 trades a tiny perceptual headroom
+# (still under speech JND at 1 kHz–6 kHz) for clean id-match survival.
+DEFAULT_ALPHA: float = 0.20
 
-# Number of STFT frames per payload bit. 10 frames × 64 bits = 640 frames
-# per pass = ~13.7 s per pass at sr=24 kHz, hop=512. A 60 s canonical clip
-# fits ~4 passes — enough redundancy to majority-vote past AAC bit flips.
-DEFAULT_BIT_FRAMES: int = 10
+# Number of STFT frames per payload bit. 8 frames × 64 bits = 512 frames
+# per pass ≈ 10.9 s per pass at sr=24 kHz, hop=512. A 60 s canonical clip
+# fits 5–6 passes — five-way majority voting beats single-pass bit flips
+# that AAC quantization injects on speech-heavy content.
+DEFAULT_BIT_FRAMES: int = 8
 
 # Sync search range, in STFT frames. A 1 kHz pitch shift or a 50 ms time
 # offset from an AAC re-encode is well under this.
