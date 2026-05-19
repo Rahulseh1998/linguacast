@@ -11,11 +11,20 @@ torch>=2.9,<2.13           # BSD-3-Clause
 torchaudio>=2.9,<2.13      # BSD-2-Clause
 
 # --- Transformers + ASR/MT --------------------------------------------------
-transformers>=4.46,<6.0    # Apache-2.0  — Whisper, MADLAD, Qwen3-TTS loaders
+transformers>=4.46,<5.0    # Apache-2.0  — MADLAD, Qwen3-TTS loaders (5.x has a Whisper-decode regression; revisit when it stabilizes)
 accelerate>=1.0,<2.0       # Apache-2.0
 sentencepiece>=0.2.0       # Apache-2.0  — required by MADLAD/T5 tokenizer
 
-# Whisper pipeline uses librosa under the hood for resampling.
+# Whisper-large-v3 via the original openai-whisper package. MIT.
+# We chose openai-whisper over the HF transformers pipeline because the
+# pipeline's experimental seq2seq chunking returns empty segments on MPS
+# in current transformers releases, and the single-pass alternative
+# silently truncates anything over 30s. openai-whisper's long-form path
+# is the well-tested one.
+openai-whisper==20250625   # MIT
+tiktoken>=0.7              # MIT  (pulled by openai-whisper)
+
+# Audio resampling. Pulled by openai-whisper; pinned explicitly for clarity.
 librosa>=0.10,<0.12        # ISC
 
 # --- I/O + numerics --------------------------------------------------------

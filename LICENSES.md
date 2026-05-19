@@ -65,7 +65,9 @@ authoritative list. Versions are pinned to permissive-licensed releases.
 | Package | License | Why |
 | --- | --- | --- |
 | torch / torchaudio | BSD-3-Clause / BSD-2-Clause | tensors + audio I/O |
-| transformers | Apache-2.0 | Whisper / MADLAD / Qwen3-TTS loaders |
+| transformers | Apache-2.0 | MADLAD / Qwen3-TTS loaders (Whisper now via `openai-whisper`) |
+| openai-whisper | MIT | ASR (Whisper-large-v3 long-form) |
+| tiktoken | MIT | tokenizer pulled by openai-whisper |
 | accelerate | Apache-2.0 | device dispatch + memory-efficient init |
 | sentencepiece | Apache-2.0 | tokenizer for T5/MADLAD |
 | librosa | ISC | audio resampling |

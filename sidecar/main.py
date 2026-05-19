@@ -95,43 +95,30 @@ def _resolve_torch_device(requested: str) -> str:
 
 
 def _load_whisper(device: str):
-    """Whisper-large-v3 via the transformers ASR pipeline.
+    """Whisper-large-v3 via the original openai-whisper package.
 
-    MIT license. The HF pipeline is the smallest amount of code that gets
-    us correctly-bucketed segments + timestamps, which is what we need for
-    later TTS alignment. Long-form transcription is handled by the pipeline
-    internally — Whisper-large-v3 sees 30-second windows.
+    MIT. We deliberately use openai-whisper here instead of the HF pipeline:
+    the HF pipeline's experimental seq2seq chunking returns empty segments
+    on MPS with current transformers releases, and the alternative (single-
+    pass, no chunking) silently truncates audio longer than 30 seconds.
+    openai-whisper's own long-form code path is the well-tested one for
+    multi-minute clips, ships clean segment+word timestamps, and is what
+    the original paper recommends.
+
+    Model weight files (~3 GB for large-v3) cache to
+    `~/.cache/whisper/` by default; we override to `$LINGUACAST_CACHE_DIR
+    /whisper/` so all of linguacast's downloads stay under one root.
     """
     global _whisper_pipeline
     if _whisper_pipeline is not None:
         return _whisper_pipeline
     log(f"loading whisper-large-v3 on {device}…")
-    import torch  # pyright: ignore
-    from transformers import (  # pyright: ignore
-        AutoModelForSpeechSeq2Seq,
-        AutoProcessor,
-        pipeline,
-    )
+    import whisper  # pyright: ignore
 
-    model_id = "openai/whisper-large-v3"
-    dtype = torch.float16 if device != "cpu" else torch.float32
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-    )
-    model.to(device)
-    processor = AutoProcessor.from_pretrained(model_id)
-    _whisper_pipeline = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        torch_dtype=dtype,
-        device=device,
-        chunk_length_s=30,
-        return_timestamps=True,
+    whisper_cache = CACHE_ROOT / "whisper"
+    whisper_cache.mkdir(parents=True, exist_ok=True)
+    _whisper_pipeline = whisper.load_model(
+        "large-v3", device=device, download_root=str(whisper_cache)
     )
     return _whisper_pipeline
 
@@ -257,30 +244,38 @@ def op_transcribe(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not audio_path.exists():
         raise SidecarError(f"audio file not found: {audio_path}")
 
-    pipe = _load_whisper(device)
+    model = _load_whisper(device)
     log(f"transcribing {audio_path.name}…")
     t0 = time.time()
-    result = pipe(str(audio_path))
+    # fp16 on MPS triggers a runtime check that fails on some macOS
+    # releases; whisper itself defaults to fp16 only on CUDA and falls
+    # back to fp32 elsewhere. We're explicit about it.
+    result = model.transcribe(
+        str(audio_path),
+        fp16=(device == "cuda"),
+        verbose=False,
+        word_timestamps=False,
+        condition_on_previous_text=True,
+    )
     log(f"  whisper took {time.time() - t0:.2f}s")
 
-    chunks = result.get("chunks") or []
     segments: List[Dict[str, Any]] = []
-    for chunk in chunks:
-        ts = chunk.get("timestamp") or (None, None)
-        start = float(ts[0]) if ts[0] is not None else 0.0
-        end = float(ts[1]) if ts[1] is not None else start
-        text = (chunk.get("text") or "").strip()
+    for seg in result.get("segments") or []:
+        text = (seg.get("text") or "").strip()
         if not text:
             continue
-        segments.append({"start": start, "end": end, "text": text})
+        segments.append(
+            {
+                "start": float(seg.get("start", 0.0)),
+                "end": float(seg.get("end", 0.0)),
+                "text": text,
+            }
+        )
     if not segments:
         text = (result.get("text") or "").strip()
         if text:
             segments.append({"start": 0.0, "end": 0.0, "text": text})
 
-    # Whisper exposes detected language via the pipeline's generate_kwargs
-    # in some releases; fall back to 'en' for the week-1 spike since our
-    # canonical clip is English. This is hard-coded to revisit in week 2.
     language = result.get("language") or "en"
     return {"kind": "transcribe", "language": language, "segments": segments}
 
