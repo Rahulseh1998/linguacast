@@ -117,22 +117,61 @@ pub fn run_dub(cli: Cli) -> Result<()> {
     let consent_record = run_consent_gate(&cli, &audio_wav)?;
 
     let pp = PipelineProgress::new(true);
+
+    // OPE-47: Transcribe once, then loop per-language for MT+TTS only.
+    let asr_result = {
+        let mut asr_bar = pp.asr_bar();
+        let mut on_asr_progress = |ev: sidecar::ProgressEvent| {
+            if let (Some(cur), Some(tot)) = (ev.current, ev.total) {
+                asr_bar.stage_substep(cur, tot, &ev.phase);
+            }
+        };
+        let t = Instant::now();
+        let result = sidecar
+            .transcribe(&audio_wav, &device, asr, &mut on_asr_progress)
+            .map_err(humanize)?;
+        info!(
+            "asr (whisper-{}): {:.1}s · {} segs · {:.0} MB peak",
+            asr,
+            t.elapsed().as_secs_f32(),
+            result.segments.len(),
+            result.peak_rss_mb,
+        );
+        asr_bar.finish_ok(&format!(
+            "lang={} · {} segs",
+            result.language,
+            result.segments.len()
+        ));
+        result
+    };
+
+    if asr_result.segments.is_empty() {
+        return Err(anyhow!("no speech detected in the input audio"));
+    }
+    let ref_text = asr_result
+        .segments
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
     let mut outputs: Vec<PathBuf> = Vec::with_capacity(cli.langs.len());
     let mut failed: Vec<(String, String)> = Vec::new();
 
     for lang in &cli.langs {
         let mut bar = pp.lang_bar(&lang.0);
-        match process_one_lang(
+        match process_one_lang_mt_tts(
             &cli,
             &device,
             tts_engine,
             &mut sidecar,
             &audio_wav,
             duration_sec,
-            asr,
             mt,
             tts_size,
             lang,
+            &asr_result,
+            &ref_text,
             &consent_record,
             &mut bar,
         ) {
@@ -226,18 +265,20 @@ fn short_hash(h: &str) -> &str {
     }
 }
 
+/// Per-language MT+TTS+mux, reusing pre-transcribed `asr_result` (OPE-47).
 #[allow(clippy::too_many_arguments)]
-fn process_one_lang(
+fn process_one_lang_mt_tts(
     cli: &Cli,
     device: &device::Device,
     _tts_engine: &str,
     sidecar: &mut sidecar::Sidecar,
     audio_wav: &std::path::Path,
     duration_sec: f32,
-    asr: &str,
     mt: &str,
     tts_size: &str,
     lang: &cli::Lang,
+    asr_result: &sidecar::TranscribeReport,
+    ref_text: &str,
     consent: &ConsentRecord,
     bar: &mut crate::progress::LangProgress,
 ) -> Result<PathBuf> {
@@ -247,9 +288,12 @@ fn process_one_lang(
         p
     };
 
-    let t = Instant::now();
+    let watermark_id_hex = watermark_id_from_consent(consent);
+
+    // Stage: MT (translate)
+    let t_wall = Instant::now();
     let mut current_stage: Option<String> = None;
-    let mut on_progress = |ev: ProgressEvent| {
+    let mut on_mt_progress = |ev: ProgressEvent| {
         if current_stage.as_deref() != Some(ev.stage.as_str()) {
             if let Some(prev) = current_stage.take() {
                 bar.stage_done(&prev, 0.0);
@@ -262,42 +306,77 @@ fn process_one_lang(
         }
     };
 
-    let watermark_id_hex = watermark_id_from_consent(consent);
-    let report = sidecar
-        .run_dub(
-            audio_wav,
-            audio_wav, // source audio doubles as speaker reference
+    // Device routing: MADLAD forces CPU (per CTO ack); others use the detected device.
+    let mt_device = if mt.starts_with("madlad") {
+        device::Device::Cpu
+    } else {
+        device.clone()
+    };
+    let tr = sidecar
+        .translate(
+            &asr_result.segments,
+            &asr_result.language,
             &lang.0,
-            &dubbed_audio,
-            duration_sec,
-            asr,
             mt,
-            tts_size,
-            device,
-            Some(&watermark_id_hex),
-            &mut on_progress,
+            &mt_device,
+            &mut on_mt_progress,
         )
         .map_err(humanize)?;
     if let Some(prev) = current_stage.take() {
         bar.stage_done(&prev, 0.0);
     }
-
     info!(
-        "run_dub ({} → {}): {:.1}s audio · {} segments · {:.1}s wall · peak RSS {:.0} MB",
-        report.language,
-        report.target_lang,
-        report.duration_sec,
-        report.segments_rendered,
-        t.elapsed().as_secs_f32(),
-        report.peak_rss_mb,
+        "mt ({} → {}): {} segs · {:.1}s wall · {:.0} MB peak",
+        asr_result.language,
+        lang.0,
+        tr.segments.len(),
+        t_wall.elapsed().as_secs_f32(),
+        tr.peak_rss_mb,
     );
-    for stage in &report.stages {
-        info!(
-            "  stage {} ({}): {:.1}s · peak RSS {:.0} MB",
-            stage.name, stage.model, stage.stage_seconds, stage.peak_rss_mb
-        );
-    }
 
+    // Stage: TTS
+    let t_tts = Instant::now();
+    let mut current_stage_tts: Option<String> = None;
+    let mut on_tts_progress = |ev: ProgressEvent| {
+        if current_stage_tts.as_deref() != Some(ev.stage.as_str()) {
+            if let Some(prev) = current_stage_tts.take() {
+                bar.stage_done(&prev, 0.0);
+            }
+            bar.stage_start(&ev.stage);
+            current_stage_tts = Some(ev.stage.clone());
+        }
+        if let (Some(cur), Some(tot)) = (ev.current, ev.total) {
+            bar.stage_substep(cur, tot, &ev.phase);
+        }
+    };
+
+    let tts = sidecar
+        .tts(
+            &tr.segments,
+            audio_wav,
+            &lang.0,
+            &dubbed_audio,
+            duration_sec,
+            ref_text,
+            tts_size,
+            device,
+            Some(&watermark_id_hex),
+            &mut on_tts_progress,
+        )
+        .map_err(humanize)?;
+    if let Some(prev) = current_stage_tts.take() {
+        bar.stage_done(&prev, 0.0);
+    }
+    info!(
+        "tts ({}): {}/{} segs rendered · {:.1}s wall · {:.0} MB peak",
+        lang.0,
+        tts.segments_rendered,
+        tr.segments.len(),
+        t_tts.elapsed().as_secs_f32(),
+        tts.peak_rss_mb,
+    );
+
+    // Stage: mux
     let input = cli.input.as_ref().expect("validated above");
     let stem = input
         .file_stem()
@@ -306,14 +385,14 @@ fn process_one_lang(
     let out_mp4 = cli.out_dir.join(format!("{stem}.{}.mp4", lang.0));
 
     bar.stage_start("mux");
-    let t = Instant::now();
+    let t_mux = Instant::now();
     let meta = build_consent_metadata(consent, &lang.0, &watermark_id_hex);
     ffmpeg::mux_replace_audio(input, &dubbed_audio, &out_mp4, &meta).map_err(humanize)?;
-    bar.stage_done("mux", t.elapsed().as_secs_f64());
+    bar.stage_done("mux", t_mux.elapsed().as_secs_f64());
     info!(
         "ffmpeg mux ({}): {:.2}s → {}",
         lang.0,
-        t.elapsed().as_secs_f32(),
+        t_mux.elapsed().as_secs_f32(),
         out_mp4.display()
     );
 
@@ -588,13 +667,35 @@ fn cache_root_hint() -> String {
 }
 
 fn cache_looks_empty(cache: &Path) -> bool {
-    if !cache.exists() {
-        return true;
+    // Check both the platform cache dir and the XDG ~/.cache path (the sidecar
+    // always writes to ~/.cache/linguacast regardless of OS, while BaseDirs on
+    // macOS resolves to ~/Library/Caches — we must not re-pull when only the
+    // XDG path is populated).
+    let candidates: Vec<std::path::PathBuf> = {
+        let mut v = vec![cache.to_path_buf()];
+        if let Some(base) = directories::BaseDirs::new() {
+            // The sidecar uses ~/.cache/linguacast unconditionally (XDG path).
+            // On macOS, BaseDirs::cache_dir() is ~/Library/Caches — different.
+            // Add ~/.cache explicitly so warm-cache detection works cross-platform.
+            let xdg = base.home_dir().join(".cache").join("linguacast");
+            if xdg != cache {
+                v.push(xdg);
+            }
+        }
+        v
+    };
+    for dir in &candidates {
+        if !dir.exists() {
+            continue;
+        }
+        let hf = dir.join("hf");
+        let whisper = dir.join("models").join("whisper");
+        let whisper_legacy = dir.join("whisper");
+        if hf.exists() || whisper.exists() || whisper_legacy.exists() {
+            return false;
+        }
     }
-    let hf = cache.join("hf");
-    let whisper = cache.join("models").join("whisper");
-    let whisper_legacy = cache.join("whisper");
-    !(hf.exists() || whisper.exists() || whisper_legacy.exists())
+    true
 }
 
 fn maybe_auto_pull(

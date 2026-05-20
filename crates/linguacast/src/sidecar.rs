@@ -116,6 +116,10 @@ pub enum Response {
         duration_sec: f32,
         #[serde(default)]
         peak_rss_mb: f64,
+        #[serde(default)]
+        segments_rendered: usize,
+        #[serde(default)]
+        watermark: serde_json::Value,
     },
     RunDub {
         out_audio_path: PathBuf,
@@ -278,6 +282,102 @@ impl Sidecar {
         }
     }
 
+    pub fn transcribe(
+        &mut self,
+        audio_path: &Path,
+        device: &Device,
+        asr: &str,
+        on_progress: ProgressFn<'_>,
+    ) -> Result<TranscribeReport> {
+        match self.send_with_progress(
+            &Request::Transcribe {
+                audio_path,
+                device: device.as_str(),
+                asr,
+            },
+            on_progress,
+        )? {
+            Response::Transcribe { language, segments, peak_rss_mb } => {
+                Ok(TranscribeReport { language, segments, peak_rss_mb })
+            }
+            Response::Error { message, .. } => Err(anyhow!("transcribe failed: {message}")),
+            other => Err(anyhow!("unexpected transcribe response: {:?}", other)),
+        }
+    }
+
+    pub fn translate(
+        &mut self,
+        segments: &[Segment],
+        source_lang: &str,
+        target_lang: &str,
+        mt: &str,
+        device: &Device,
+        on_progress: ProgressFn<'_>,
+    ) -> Result<TranslateReport> {
+        match self.send_with_progress(
+            &Request::Translate {
+                segments,
+                source_lang,
+                target_lang,
+                mt,
+                device: device.as_str(),
+            },
+            on_progress,
+        )? {
+            Response::Translate { segments, peak_rss_mb } => {
+                Ok(TranslateReport { segments, peak_rss_mb })
+            }
+            Response::Error { message, .. } => Err(anyhow!("translate failed: {message}")),
+            other => Err(anyhow!("unexpected translate response: {:?}", other)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn tts(
+        &mut self,
+        segments: &[Segment],
+        reference_audio_path: &Path,
+        target_lang: &str,
+        out_audio_path: &Path,
+        target_duration_sec: f32,
+        ref_text: &str,
+        tts_size: &str,
+        device: &Device,
+        watermark_id: Option<&str>,
+        on_progress: ProgressFn<'_>,
+    ) -> Result<TtsReport> {
+        match self.send_with_progress(
+            &Request::Tts {
+                segments,
+                reference_audio_path,
+                target_lang,
+                out_audio_path,
+                target_duration_sec,
+                ref_text,
+                tts_size,
+                device: device.as_str(),
+                engine: "qwen3-tts",
+            },
+            on_progress,
+        )? {
+            Response::Tts {
+                out_audio_path,
+                duration_sec,
+                peak_rss_mb,
+                segments_rendered,
+                watermark,
+            } => Ok(TtsReport {
+                out_audio_path,
+                duration_sec,
+                segments_rendered,
+                peak_rss_mb,
+                watermark,
+            }),
+            Response::Error { message, .. } => Err(anyhow!("tts failed: {message}")),
+            other => Err(anyhow!("unexpected tts response: {:?}", other)),
+        }
+    }
+
     pub fn hello(&mut self) -> Result<()> {
         match self.send(&Request::Hello)? {
             Response::Hello {
@@ -309,62 +409,6 @@ impl Sidecar {
             Response::Pull { cache_root, models } => Ok((cache_root, models)),
             Response::Error { message, .. } => Err(anyhow!("pull failed: {message}")),
             other => Err(anyhow!("unexpected pull response: {:?}", other)),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_dub(
-        &mut self,
-        audio_path: &Path,
-        reference_audio_path: &Path,
-        target_lang: &str,
-        out_audio_path: &Path,
-        target_duration_sec: f32,
-        asr: &str,
-        mt: &str,
-        tts_size: &str,
-        device: &Device,
-        watermark_id: Option<&str>,
-        on_progress: ProgressFn<'_>,
-    ) -> Result<RunDubReport> {
-        match self.send_with_progress(
-            &Request::RunDub {
-                audio_path,
-                reference_audio_path,
-                target_lang,
-                out_audio_path,
-                target_duration_sec,
-                asr,
-                mt,
-                tts_size,
-                device: device.as_str(),
-                watermark_id,
-            },
-            on_progress,
-        )? {
-            Response::RunDub {
-                out_audio_path,
-                duration_sec,
-                language,
-                target_lang,
-                segments,
-                segments_rendered,
-                watermark,
-                stages,
-                peak_rss_mb,
-            } => Ok(RunDubReport {
-                out_audio_path,
-                duration_sec,
-                language,
-                target_lang,
-                segments,
-                segments_rendered,
-                stages,
-                peak_rss_mb,
-                watermark,
-            }),
-            Response::Error { message, .. } => Err(anyhow!("run_dub failed: {message}")),
-            other => Err(anyhow!("unexpected run_dub response: {:?}", other)),
         }
     }
 
@@ -402,6 +446,28 @@ impl Sidecar {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TranscribeReport {
+    pub language: String,
+    pub segments: Vec<Segment>,
+    pub peak_rss_mb: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranslateReport {
+    pub segments: Vec<Segment>,
+    pub peak_rss_mb: f64,
+}
+
+#[derive(Debug)]
+pub struct TtsReport {
+    pub out_audio_path: PathBuf,
+    pub duration_sec: f32,
+    pub segments_rendered: usize,
+    pub peak_rss_mb: f64,
+    pub watermark: serde_json::Value,
+}
+
 #[derive(Debug)]
 pub struct RunDubReport {
     pub out_audio_path: PathBuf,
@@ -436,6 +502,171 @@ impl Drop for Sidecar {
             warn!("sidecar kill failed: {e}");
         }
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Minimal mock sidecar that handles hello/transcribe/translate/tts and writes
+    /// op counts to MOCK_OP_COUNT_FILE so the test can verify ASR runs exactly once.
+    const MOCK_SIDECAR_PY: &str = r#"
+import sys, json, os, wave, struct
+
+count_file = os.environ.get("MOCK_OP_COUNT_FILE", "")
+op_counts = {}
+
+def write_counts():
+    if count_file:
+        with open(count_file, "w") as f:
+            json.dump(op_counts, f)
+
+def silent_wav(path, sr=24000, frames=240):
+    with wave.open(path, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(struct.pack("<" + "h" * frames, *([0] * frames)))
+
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    payload = json.loads(line)
+    op = payload.get("op", "")
+    op_counts[op] = op_counts.get(op, 0) + 1
+    write_counts()
+
+    if op == "hello":
+        print(json.dumps({"kind": "hello", "version": "mock-1.0",
+                          "torch_device": "cpu", "torch_version": "2.0"}), flush=True)
+    elif op == "transcribe":
+        print(json.dumps({
+            "kind": "transcribe", "language": "en",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hello world"}],
+            "stage_seconds": 0.001, "peak_rss_mb": 10.0
+        }), flush=True)
+    elif op == "translate":
+        tgt = payload.get("target_lang", "es")
+        segs = payload.get("segments", [])
+        out_segs = [{"start": s["start"], "end": s["end"], "text": f"({tgt}) {s['text']}"} for s in segs]
+        print(json.dumps({
+            "kind": "translate", "segments": out_segs,
+            "stage_seconds": 0.001, "peak_rss_mb": 10.0
+        }), flush=True)
+    elif op == "tts":
+        out = payload.get("out_audio_path", "/tmp/mock_tts_out.wav")
+        silent_wav(out)
+        print(json.dumps({
+            "kind": "tts", "out_audio_path": out,
+            "duration_sec": 0.01, "sample_rate": 24000,
+            "segments_rendered": len(payload.get("segments", [])),
+            "stage_seconds": 0.001, "peak_rss_mb": 10.0,
+            "watermark": {"embedded": False}
+        }), flush=True)
+    else:
+        print(json.dumps({"kind": "error", "message": f"unknown op: {op}",
+                          "recoverable": True}), flush=True)
+"#;
+
+    fn find_python() -> PathBuf {
+        for candidate in &["python3", "python"] {
+            if let Ok(p) = which::which(candidate) {
+                return p;
+            }
+        }
+        PathBuf::from("python3")
+    }
+
+    /// Verify that the typed transcribe/translate/tts methods work correctly and
+    /// that a two-language run calls ASR exactly once (the OPE-47 invariant).
+    #[test]
+    fn asr_once_two_langs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let sidecar_script = tmp.path().join("main.py");
+        std::fs::write(&sidecar_script, MOCK_SIDECAR_PY).unwrap();
+
+        let count_file = tmp.path().join("op_counts.json");
+        std::env::set_var("MOCK_OP_COUNT_FILE", count_file.display().to_string());
+
+        // Minimal WAV for the audio path argument (mock doesn't read it).
+        let audio = tmp.path().join("audio.wav");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&audio).unwrap();
+            // 44-byte RIFF/WAV header with 0 data bytes
+            f.write_all(b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\
+                         \x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\
+                         \x02\x00\x10\x00data\x00\x00\x00\x00").unwrap();
+        }
+
+        let python = find_python();
+        let mut sidecar = Sidecar::launch(Some(&python), tmp.path()).unwrap();
+        sidecar.hello().unwrap();
+
+        let device = Device::Cpu;
+
+        // --- ASR once ---
+        let asr = sidecar
+            .transcribe(&audio, &device, "large-v3", &mut |_| {})
+            .expect("transcribe should succeed");
+        assert_eq!(asr.language, "en");
+        assert!(!asr.segments.is_empty(), "mock should return at least one segment");
+
+        // --- Two-lang MT+TTS loop reusing ASR segments ---
+        for lang in &["es", "fr"] {
+            let out = tmp.path().join(format!("out_{lang}.wav"));
+            let tr = sidecar
+                .translate(&asr.segments, "en", lang, "m2m100-418m", &device, &mut |_| {})
+                .unwrap_or_else(|e| panic!("translate({lang}) failed: {e}"));
+            assert!(!tr.segments.is_empty());
+
+            let tts = sidecar
+                .tts(
+                    &tr.segments,
+                    &audio,
+                    lang,
+                    &out,
+                    1.0,
+                    "hello world",
+                    "1.7B",
+                    &device,
+                    None,
+                    &mut |_| {},
+                )
+                .unwrap_or_else(|e| panic!("tts({lang}) failed: {e}"));
+            assert_eq!(tts.segments_rendered, 1);
+            assert!(out.exists(), "TTS should write the output WAV");
+        }
+
+        // Drop sidecar before reading count file (stdin close triggers flush).
+        drop(sidecar);
+
+        let counts_raw = std::fs::read_to_string(&count_file)
+            .expect("mock sidecar should have written op count file");
+        let counts: HashMap<String, u64> =
+            serde_json::from_str(&counts_raw).expect("op count file should be valid JSON");
+
+        assert_eq!(
+            counts.get("transcribe").copied().unwrap_or(0),
+            1,
+            "ASR (transcribe) must run exactly once for multi-lang runs"
+        );
+        assert_eq!(
+            counts.get("translate").copied().unwrap_or(0),
+            2,
+            "translate should run once per language (es + fr)"
+        );
+        assert_eq!(
+            counts.get("tts").copied().unwrap_or(0),
+            2,
+            "tts should run once per language (es + fr)"
+        );
+
+        std::env::remove_var("MOCK_OP_COUNT_FILE");
     }
 }
 

@@ -1,8 +1,8 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-/// Stage labels in the order the pipeline runs them.
-pub const STAGES: &[&str] = &["asr", "mt", "tts", "mux"];
+/// Per-language stage labels. ASR runs once before the lang loop (OPE-47).
+pub const STAGES: &[&str] = &["mt", "tts", "mux"];
 
 /// Per-language progress: one bar that walks through asr → mt → tts → mux.
 /// Each bar tracks 4 stage steps (length=4) so the user sees concrete advance
@@ -65,6 +65,21 @@ impl PipelineProgress {
             multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
         }
         Self { multi }
+    }
+
+    /// Single-stage bar for the one-time ASR step that runs before the lang loop.
+    pub fn asr_bar(&self) -> LangProgress {
+        let style = ProgressStyle::with_template(
+            "{prefix:>4} [{bar:24.cyan/blue}] {msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("█▉▊▋▌▍▎▏ ");
+        let pb = self.multi.add(ProgressBar::new(1));
+        pb.set_style(style);
+        pb.set_prefix("asr");
+        pb.set_message("running…".to_string());
+        pb.enable_steady_tick(Duration::from_millis(120));
+        LangProgress { bar: pb, stage_idx: 0 }
     }
 
     pub fn lang_bar(&self, lang: &str) -> LangProgress {

@@ -738,29 +738,35 @@ def op_tts(payload: Dict[str, Any]) -> Dict[str, Any]:
     rendered = 0
     total_segments = len(segments)
     emit_progress("tts", "infer", current=0, total=total_segments, label=target_lang)
-    for idx, seg in enumerate(segments, start=1):
-        text = (seg.get("text") or "").strip()
-        if not text:
-            emit_progress("tts", "infer", current=idx, total=total_segments, label=target_lang)
-            continue
-        wavs, sr = model.generate_voice_clone(
-            text=text,
-            language=lang_name,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
+
+    # Batched synthesis: group non-empty segments to amortise model overhead.
+    # Batch size 4 keeps peak RSS within the 8 GB ceiling on M1 MPS.
+    TTS_BATCH = int(os.environ.get("LINGUACAST_TTS_BATCH", "4"))
+    valid_segs = [(i, seg) for i, seg in enumerate(segments) if (seg.get("text") or "").strip()]
+    done_count = 0
+    for batch_start in range(0, len(valid_segs), TTS_BATCH):
+        batch = valid_segs[batch_start : batch_start + TTS_BATCH]
+        texts = [(seg.get("text") or "").strip() for _, seg in batch]
+        batch_wavs, sr = model.generate_voice_clone(
+            text=texts,
+            language=[lang_name] * len(texts),
+            ref_audio=[ref_audio] * len(texts),
+            ref_text=[ref_text] * len(texts),
         )
-        emit_progress("tts", "infer", current=idx, total=total_segments, label=target_lang)
-        audio = _to_mono_float32(wavs[0])
-        if sr != out_sr:
-            audio = _linear_resample(audio, sr, out_sr)
-        start_idx = int(float(seg["start"]) * out_sr)
-        if start_idx >= len(track):
-            continue
-        end_idx = min(start_idx + len(audio), len(track))
-        track[start_idx:end_idx] = audio[: end_idx - start_idx]
-        rendered += 1
+        for (_, seg), wav in zip(batch, batch_wavs):
+            audio = _to_mono_float32(wav)
+            if sr != out_sr:
+                audio = _linear_resample(audio, sr, out_sr)
+            start_idx = int(float(seg["start"]) * out_sr)
+            if start_idx < len(track):
+                end_idx = min(start_idx + len(audio), len(track))
+                track[start_idx:end_idx] = audio[: end_idx - start_idx]
+            rendered += 1
+        done_count += len(batch)
+        emit_progress("tts", "infer", current=done_count, total=total_segments, label=target_lang)
+
     synth_secs = time.time() - t0
-    log(f"  qwen3-tts rendered {rendered}/{len(segments)} segments in {synth_secs:.2f}s")
+    log(f"  qwen3-tts rendered {rendered}/{len(segments)} segments in {synth_secs:.2f}s (batch={TTS_BATCH})")
 
     # OPE-13 launch-blocker: embed the perceptual watermark in the
     # synthesized track *before* writing to disk so it survives ffmpeg
